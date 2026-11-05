@@ -162,12 +162,15 @@ check_not_contains "a stub gets no removal hint" "once backed up" "$out"
 
 mkdir -p "$d/home/.ssh/keys"
 ssh-keygen -q -t ed25519 -N '' -C test -f "$d/home/.ssh/keys/test" >/dev/null
+ssh-keygen -q -t ed25519 -N '' -C work -f "$d/home/.ssh/work" >/dev/null
 sock="$d/agent.sock"
 eval "$(ssh-agent -a "$sock" -s)" >/dev/null
 agents+=("$SSH_AGENT_PID")
 
 out="$(TEST_SSH_AUTH_SOCK="$sock" run_ankh "$d" check)"
 check_contains "an empty agent is found" "no keys loaded" "$out"
+check_contains "keys in ~/.ssh and ~/.ssh/keys are both found" "2 key(s) on disk" "$out"
+check_contains "a key in ~/.ssh is reported" "not loaded  ~/.ssh/work.pub" "$out"
 check_contains "an unloaded key is reported" "not loaded  ~/.ssh/keys/test.pub" "$out"
 
 SSH_AUTH_SOCK="$sock" ssh-add -q "$d/home/.ssh/keys/test" 2>/dev/null

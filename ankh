@@ -30,7 +30,8 @@ unset _path _dir
 
 ANKH_STORE="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
 ANKH_GNUPGHOME="${GNUPGHOME:-$HOME/.gnupg}"
-ANKH_SSH_KEYS="$HOME/.ssh/keys"
+# SSH keys default to ~/.ssh; ~/.ssh/keys is where greb put them.
+ANKH_SSH_DIRS=("$HOME/.ssh" "$HOME/.ssh/keys")
 
 banner() {
   cat <<'BANNER'
@@ -389,9 +390,11 @@ _check_pass() {
 _check_ssh() {
   _section "ssh"
   local -a pubs=()
-  local p
-  for p in "$ANKH_SSH_KEYS"/*.pub "$HOME"/.ssh/id_*.pub; do
-    [[ -f "$p" ]] && pubs+=("$p")
+  local p dir
+  for dir in "${ANKH_SSH_DIRS[@]}"; do
+    for p in "$dir"/*.pub; do
+      [[ -f "$p" ]] && pubs+=("$p")
+    done
   done
   if [[ ${#pubs[@]} -gt 0 ]]; then
     _ok "${#pubs[@]} key(s) on disk"
