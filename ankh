@@ -1,0 +1,514 @@
+#!/usr/bin/env bash
+############################################
+##  █████╗ ███╗   ██╗██╗  ██╗██╗  ██╗     ##
+## ██╔══██╗████╗  ██║██║ ██╔╝██║  ██║     ##
+## ███████║██╔██╗ ██║█████╔╝ ███████║     ##
+## ██╔══██║██║╚██╗██║██╔═██╗ ██╔══██║     ##
+## ██║  ██║██║ ╚████║██║  ██╗██║  ██║     ##
+## ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝     ##
+############################################
+## SPDX-License-Identifier:               ##
+## GPL-3.0-or-later                       ##
+## Developed and tested on bash 5.3       ##
+############################################
+# ankh: identity bootstrap for a fresh machine. Gets a gpg key, a pass store
+# that decrypts and SSH working, then stops.
+if [[ "${BASH_VERSINFO[0]}" -lt 5 ]]; then
+  echo "ankh: bash 5+ required (have ${BASH_VERSION})" >&2
+  exit 1
+fi
+set -euo pipefail
+
+ANKH_VERSION="0.1.0-dev"
+
+# Drop ankh's own directory from PATH so the commands it runs (gpg, pass, ...)
+# never resolve to sibling files installed next to the script itself.
+_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$_dir" | paste -sd ':' || true)"
+if [[ -n "$_path" ]]; then PATH="$_path"; fi
+unset _path _dir
+
+ANKH_STORE="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
+ANKH_GNUPGHOME="${GNUPGHOME:-$HOME/.gnupg}"
+ANKH_SSH_KEYS="$HOME/.ssh/keys"
+
+banner() {
+  cat <<'BANNER'
+ █████╗ ███╗   ██╗██╗  ██╗██╗  ██╗
+██╔══██╗████╗  ██║██║ ██╔╝██║  ██║
+███████║██╔██╗ ██║█████╔╝ ███████║
+██╔══██║██║╚██╗██║██╔═██╗ ██╔══██║
+██║  ██║██║ ╚████║██║  ██╗██║  ██║
+╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝
+BANNER
+  printf 'ankh %s: identity bootstrap for a fresh machine\n\n' "$ANKH_VERSION"
+}
+
+usage() {
+  echo "Usage: ankh <command> [options]"
+  echo ""
+  echo "Commands:"
+  echo "  check [--decrypt]      Report on tools, gpg-agent, keys, the pass store"
+  echo "                         and SSH; changes nothing. --decrypt also decrypts"
+  echo "                         one entry (may ask for the passphrase); the value"
+  echo "                         is discarded, never shown"
+  echo "  version                Print ankh's version"
+  echo "  help                   Show this help"
+  echo ""
+  echo "Environment:"
+  echo "  GNUPGHOME              gpg home (default ~/.gnupg)"
+  echo "  PASSWORD_STORE_DIR     pass store (default ~/.password-store)"
+}
+
+# --- check: report lines ---------------------------------------------------
+# One line per finding: a mark, then the text. FAIL means a required piece is
+# missing or broken; warn means it works but something needs attention.
+
+CHECK_FAILS=0
+CHECK_WARNS=0
+
+_section() { printf '%s\n' "$1"; }
+_ok() { printf '  ok    %s\n' "$1"; }
+_info() { printf '  --    %s\n' "$1"; }
+_warn() {
+  printf '  warn  %s\n' "$1"
+  CHECK_WARNS=$((CHECK_WARNS + 1))
+}
+_fail() {
+  printf '  FAIL  %s\n' "$1"
+  CHECK_FAILS=$((CHECK_FAILS + 1))
+}
+_detail() { printf '          %s\n' "$1"; }
+
+_date() {
+  # Epoch seconds to YYYY-MM-DD, without GNU/BSD date differences.
+  local out
+  printf -v out '%(%F)T' "$1"
+  printf '%s' "$out"
+}
+
+# --- check: tools ----------------------------------------------------------
+
+_tool_version() {
+  case "$1" in
+  gpg) gpg --version 2>/dev/null | awk 'NR==1{print $3}' ;;
+  git) git --version 2>/dev/null | awk '{print $3}' ;;
+  pass) pass --version 2>/dev/null | grep -oE 'v[0-9][0-9.]*' | head -1 ;;
+  ssh) ssh -V 2>&1 | awk -F'[ ,]' '{print $1}' ;;
+  rsync) rsync --version 2>/dev/null | awk 'NR==1{print $3}' ;;
+  *) printf '' ;;
+  esac
+}
+
+_check_tools() {
+  _section "tools"
+  _ok "bash $BASH_VERSION"
+  local t v
+  for t in gpg gpgconf gpg-connect-agent git pass ssh ssh-keygen ssh-add scp; do
+    if command -v "$t" >/dev/null 2>&1; then
+      v="$(_tool_version "$t")"
+      _ok "$t${v:+ $v}"
+    else
+      _fail "$t: not found (required)"
+    fi
+  done
+  local -A why=(
+    [rsync]="copying between machines; scp is used without it"
+    [paperkey]="a printable copy of the secret key in backups"
+    [ykman]="YubiKey touch policy"
+    [qrencode]="QR codes for pasted bundles"
+  )
+  for t in rsync paperkey ykman qrencode; do
+    if command -v "$t" >/dev/null 2>&1; then
+      v="$(_tool_version "$t")"
+      _ok "$t${v:+ $v}"
+    else
+      _info "$t: not installed (optional: ${why[$t]})"
+    fi
+  done
+}
+
+# --- check: gpg-agent ------------------------------------------------------
+
+_agent_option() {
+  # The configured value of a gpg-agent option, without gpgconf's quoting.
+  gpgconf --list-options gpg-agent 2>/dev/null |
+    awk -F: -v o="$1" '$1==o{v=$10; sub(/^"/, "", v); print v}'
+}
+
+_check_agent() {
+  _section "gpg-agent"
+  command -v gpg-connect-agent >/dev/null 2>&1 || {
+    _fail "gpg-connect-agent not found"
+    return 0
+  }
+  local v
+  if v="$(gpg-connect-agent 'getinfo version' /bye 2>/dev/null | awk '/^D /{print $2}')" && [[ -n "$v" ]]; then
+    _ok "running, $v ($(gpgconf --list-dirs agent-socket 2>/dev/null))"
+  else
+    _fail "not reachable: gpg-connect-agent could not start or reach it"
+    return 0
+  fi
+
+  local pin
+  pin="$(_agent_option pinentry-program)"
+  if [[ -n "$pin" ]]; then
+    if [[ -x "$pin" ]]; then _ok "pinentry $pin"; else _fail "pinentry $pin: not executable"; fi
+  elif command -v pinentry >/dev/null 2>&1; then
+    _ok "pinentry $(command -v pinentry) (default)"
+  else
+    _fail "no pinentry: set pinentry-program in gpg-agent.conf or install one"
+  fi
+
+  if [[ -t 0 ]]; then
+    local here
+    here="$(tty)"
+    if [[ -z "${GPG_TTY:-}" ]]; then
+      _warn "GPG_TTY is not set: a terminal pinentry can't find this terminal"
+      _detail "add to your shell config: export GPG_TTY=\$(tty)"
+    elif [[ "$GPG_TTY" != "$here" ]]; then
+      _warn "GPG_TTY is $GPG_TTY, this terminal is $here"
+    else
+      _ok "GPG_TTY $GPG_TTY"
+    fi
+  else
+    _info "not on a terminal: GPG_TTY not checked"
+  fi
+}
+
+# --- check: keys -----------------------------------------------------------
+# Parsed from --with-colons. Field 12 holds a key's own capabilities in lower
+# case; field 15 is "#" for a stub, a serial number for a key on a card.
+
+declare -a KEY_ENC_IDS=() KEY_AUTH_GRIPS=()
+
+_key_where() {
+  case "$1" in
+  "#") printf 'not on this machine (stub)' ;;
+  "" | "+") printf 'on this machine' ;;
+  *) printf 'on card %s' "$1" ;;
+  esac
+}
+
+_key_uses() {
+  local caps="$1" out=() c
+  for ((c = 0; c < ${#caps}; c++)); do
+    case "${caps:c:1}" in
+    c) out+=(certify) ;;
+    s) out+=(sign) ;;
+    e) out+=(encrypt) ;;
+    a) out+=(auth) ;;
+    esac
+  done
+  local IFS=,
+  printf '%s' "${out[*]}"
+}
+
+_key_expiry() {
+  # Prints the expiry, and returns 1 when it is within 30 days.
+  local exp="$1" now
+  [[ -n "$exp" ]] || {
+    printf 'no expiry'
+    return 0
+  }
+  printf -v now '%(%s)T' -1
+  printf 'expires %s' "$(_date "$exp")"
+  ((exp - now > 30 * 86400))
+}
+
+_check_keys() {
+  _section "keys"
+  command -v gpg >/dev/null 2>&1 || {
+    _fail "gpg not found"
+    return 0
+  }
+  local -a lines
+  mapfile -t lines < <(gpg --with-colons --fixed-list-mode --with-keygrip --list-secret-keys 2>/dev/null)
+  if [[ ${#lines[@]} -eq 0 ]]; then
+    _fail "no secret keys in $ANKH_GNUPGHOME"
+    return 0
+  fi
+
+  local line kind="" uid="" fpr="" n=0
+  local -a f
+  local -a sub_lines=()
+  local primary=""
+
+  _flush_key() {
+    [[ -n "$primary" ]] || return 0
+    IFS=: read -r -a f <<<"$primary"
+    local validity="${f[1]}" exp="${f[6]}" caps="${f[11]}" token="${f[14]:-}"
+    if [[ "$validity" == r ]]; then
+      _info "$fpr $uid: revoked"
+      primary=""
+      return 0
+    fi
+    if [[ "$validity" == e ]]; then
+      _warn "$fpr $uid: expired"
+      primary=""
+      return 0
+    fi
+    _ok "$fpr $uid"
+    local e
+    if e="$(_key_expiry "$exp")"; then :; else _warn "primary key $e"; fi
+    _detail "primary  $(_key_uses "$caps")  $(_key_where "$token")  $e"
+    if [[ "$token" != "#" && "$caps" == *c* ]]; then
+      _detail "the primary key is on this machine: once backed up, it can be removed"
+    fi
+    local s has_enc=0 has_auth=0
+    for s in "${sub_lines[@]}"; do
+      IFS=: read -r -a f <<<"$s"
+      local sv="${f[1]}" sid="${f[4]}" sexp="${f[6]}" scaps="${f[11]}" stok="${f[14]:-}" sgrip="${f[20]:-}"
+      [[ "$sv" == r || "$sv" == e ]] && continue
+      if e="$(_key_expiry "$sexp")"; then :; else _warn "subkey $sid $e"; fi
+      _detail "$(printf '%-8s' "$(_key_uses "$scaps")") $sid  $(_key_where "$stok")  $e"
+      if [[ "$scaps" == *e* && "$stok" != "#" ]]; then
+        has_enc=1
+        KEY_ENC_IDS+=("$sid")
+      fi
+      if [[ "$scaps" == *a* && "$stok" != "#" ]]; then
+        has_auth=1
+        KEY_AUTH_GRIPS+=("$sgrip")
+      fi
+    done
+    [[ $has_enc -eq 1 ]] || _warn "no usable encryption subkey: this key can't decrypt a pass store"
+    [[ $has_auth -eq 1 ]] || _detail "no authentication subkey: SSH through gpg-agent isn't possible with it"
+    n=$((n + 1))
+    primary=""
+  }
+
+  for line in "${lines[@]}"; do
+    kind="${line%%:*}"
+    case "$kind" in
+    sec)
+      _flush_key
+      primary="$line"
+      uid=""
+      fpr=""
+      sub_lines=()
+      kind=sec
+      ;;
+    fpr)
+      [[ -z "$fpr" ]] && fpr="$(cut -d: -f10 <<<"$line")"
+      ;;
+    grp)
+      # The keygrip belongs to the record before it; append it as field 21.
+      if [[ ${#sub_lines[@]} -gt 0 ]]; then
+        local last=$((${#sub_lines[@]} - 1))
+        IFS=: read -r -a f <<<"${sub_lines[$last]}"
+        if [[ -z "${f[20]:-}" ]]; then
+          while [[ ${#f[@]} -lt 20 ]]; do f+=(""); done
+          f[20]="$(cut -d: -f10 <<<"$line")"
+          sub_lines[last]="$(
+            IFS=:
+            printf '%s' "${f[*]}"
+          )"
+        fi
+      fi
+      ;;
+    uid)
+      IFS=: read -r -a f <<<"$line"
+      [[ -z "$uid" && "${f[1]}" != r ]] && uid="${f[9]}"
+      ;;
+    ssb)
+      sub_lines+=("$line")
+      ;;
+    esac
+  done
+  _flush_key
+  unset -f _flush_key
+
+  if command -v timeout >/dev/null 2>&1; then
+    local serial
+    serial="$(timeout 10 gpg --with-colons --card-status 2>/dev/null | awk -F: '/^serial:/{print $2}')" || true
+    if [[ -n "$serial" ]]; then _ok "card $serial present"; else _info "no card"; fi
+  fi
+}
+
+# --- check: the pass store -------------------------------------------------
+
+_check_pass() {
+  local decrypt="$1"
+  _section "pass"
+  if [[ ! -d "$ANKH_STORE" ]]; then
+    _fail "no store at $ANKH_STORE"
+    return 0
+  fi
+  if [[ ! -f "$ANKH_STORE/.gpg-id" ]]; then
+    _fail "$ANKH_STORE has no .gpg-id: not a pass store"
+    return 0
+  fi
+  local count
+  count="$(find "$ANKH_STORE" -path "$ANKH_STORE/.git" -prune -o -type f -name '*.gpg' -print | wc -l)"
+  _ok "$ANKH_STORE, $((count)) entries"
+  if git -C "$ANKH_STORE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local remote
+    remote="$(git -C "$ANKH_STORE" remote get-url origin 2>/dev/null || true)"
+    if [[ -n "$remote" ]]; then _ok "git, remote $remote"; else _info "git, no remote"; fi
+  else
+    _info "not a git repository"
+  fi
+
+  local sample
+  sample="$(find "$ANKH_STORE" -path "$ANKH_STORE/.git" -prune -o -type f -name '*.gpg' -print -quit)"
+  [[ -n "$sample" ]] || {
+    _info "no entries to test against"
+    return 0
+  }
+  # --list-only skips the decryption itself: only the recipients are read.
+  local -a to
+  mapfile -t to < <(gpg --batch --list-only --status-fd 1 --decrypt "$sample" 2>/dev/null |
+    awk '$1=="[GNUPG:]" && $2=="ENC_TO"{print toupper($3)}')
+  local id hit=""
+  for id in "${to[@]}"; do
+    local mine
+    for mine in "${KEY_ENC_IDS[@]}"; do
+      [[ "${mine^^}" == "$id" ]] && hit="$id"
+    done
+  done
+  if [[ -n "$hit" ]]; then
+    _ok "entries are encrypted to subkey $hit, which this machine has"
+  else
+    _fail "entries are encrypted to ${to[*]:-unknown keys}: none of them is usable here"
+    return 0
+  fi
+
+  if [[ "$decrypt" -eq 1 ]]; then
+    if gpg --quiet --decrypt "$sample" >/dev/null 2>&1; then
+      _ok "test decrypt succeeded"
+    else
+      _fail "test decrypt failed"
+    fi
+  else
+    _info "test decrypt skipped (ankh check --decrypt)"
+  fi
+}
+
+# --- check: SSH ------------------------------------------------------------
+
+_check_ssh() {
+  _section "ssh"
+  local -a pubs=()
+  local p
+  for p in "$ANKH_SSH_KEYS"/*.pub "$HOME"/.ssh/id_*.pub; do
+    [[ -f "$p" ]] && pubs+=("$p")
+  done
+  if [[ ${#pubs[@]} -gt 0 ]]; then
+    _ok "${#pubs[@]} key(s) on disk"
+  elif [[ ${#KEY_AUTH_GRIPS[@]} -gt 0 ]]; then
+    _info "no key files: only gpg authentication subkeys"
+  else
+    _fail "no SSH key: none on disk and no gpg authentication subkey"
+  fi
+
+  if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+    _warn "no agent: SSH_AUTH_SOCK is not set"
+    return 0
+  fi
+  if [[ ! -S "$SSH_AUTH_SOCK" ]]; then
+    _warn "no agent: $SSH_AUTH_SOCK is not a socket"
+    return 0
+  fi
+
+  local which="another agent"
+  local gpg_ssh
+  gpg_ssh="$(gpgconf --list-dirs agent-ssh-socket 2>/dev/null || true)"
+  if [[ -n "$gpg_ssh" && "$SSH_AUTH_SOCK" -ef "$gpg_ssh" ]]; then
+    which="gpg-agent"
+  elif [[ "$SSH_AUTH_SOCK" == *keyring* ]]; then
+    which="GNOME Keyring"
+  elif [[ "$SSH_AUTH_SOCK" == *com.apple.launchd* ]]; then
+    which="macOS's agent"
+  elif [[ "$SSH_AUTH_SOCK" == */.ssh/agent/s.*.sshd.* ]]; then
+    # OpenSSH 10.1+ keeps agent sockets in ~/.ssh/agent; sshd's are forwarded.
+    which="a forwarded agent"
+  elif [[ "$SSH_AUTH_SOCK" == */.ssh/agent/s.* || "$SSH_AUTH_SOCK" == *agent.* || "$SSH_AUTH_SOCK" == *ssh-agent* ]]; then
+    which="ssh-agent"
+  fi
+
+  local listed rc=0
+  listed="$(ssh-add -l 2>/dev/null)" || rc=$?
+  case "$rc" in
+  0) _ok "$which at $SSH_AUTH_SOCK, $(wc -l <<<"$listed") key(s) loaded" ;;
+  1)
+    _ok "$which at $SSH_AUTH_SOCK, no keys loaded"
+    listed=""
+    ;;
+  *)
+    _warn "$SSH_AUTH_SOCK doesn't answer (ssh-add -l exited $rc)"
+    return 0
+    ;;
+  esac
+
+  local fp name
+  for p in "${pubs[@]}"; do
+    fp="$(ssh-keygen -lf "$p" 2>/dev/null | awk '{print $2}')"
+    name="${p#"$HOME"/}"
+    if [[ -n "$fp" ]] && grep -qF " $fp " <<<"$listed"; then
+      _detail "loaded      ~/$name"
+    else
+      _detail "not loaded  ~/$name"
+    fi
+  done
+
+  local enabled
+  enabled="$(_agent_option enable-ssh-support)"
+  if [[ "$which" == "gpg-agent" ]]; then
+    local grip control="$ANKH_GNUPGHOME/sshcontrol"
+    for grip in "${KEY_AUTH_GRIPS[@]}"; do
+      if [[ -f "$control" ]] && grep -qE "^[[:space:]]*$grip([[:space:]]|$)" "$control"; then
+        _detail "offered     authentication subkey $grip"
+      else
+        _detail "not offered authentication subkey $grip (not in sshcontrol)"
+      fi
+    done
+  elif [[ -n "$enabled" ]]; then
+    _info "gpg-agent has SSH support on, but SSH_AUTH_SOCK points to $which"
+  fi
+}
+
+cmd_check() {
+  local decrypt=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --decrypt) decrypt=1 ;;
+    *)
+      echo "ankh check: unknown option '$1'" >&2
+      exit 1
+      ;;
+    esac
+    shift
+  done
+  _check_tools
+  _check_agent
+  _check_keys
+  _check_pass "$decrypt"
+  _check_ssh
+  printf 'check: %d failed, %d warnings\n' "$CHECK_FAILS" "$CHECK_WARNS"
+  [[ $CHECK_FAILS -eq 0 ]]
+}
+
+main() {
+  case "${1:-}" in
+  check)
+    shift
+    cmd_check "$@"
+    ;;
+  version | --version)
+    printf 'ankh %s\n' "$ANKH_VERSION"
+    ;;
+  "")
+    banner
+    usage
+    ;;
+  help | --help | -h)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+  esac
+}
+
+main "$@"
