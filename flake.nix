@@ -33,7 +33,7 @@
         '';
         meta = with pkgs.lib; {
           description = "Identity bootstrap for a fresh machine";
-          homepage = "https://codeberg.org/lede/ankh";
+          homepage = "https://git.krypta.fi/scripts-shell/ankh";
           license = licenses.gpl3Plus;
           mainProgram = "ankh";
           platforms = platforms.unix;
