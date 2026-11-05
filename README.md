@@ -8,7 +8,7 @@ Identity bootstrap for a freshly installed machine. ankh gets three things worki
 
 Everything after that (logins, service credentials, other secrets) is left to other tools. ankh only builds the foundation they stand on.
 
-The source lives at [git.krypta.fi/scripts-shell/ankh](https://git.krypta.fi/scripts-shell/ankh) and is mirrored to [Codeberg](https://codeberg.org/lede/ankh). Any of them can serve the script; releases are checked the same way wherever the copy came from.
+ankh is published on [Codeberg](https://codeberg.org/lede/ankh). Any copy can serve the script: releases are checked the same way wherever it came from.
 
 ## Status
 
@@ -23,7 +23,7 @@ Early. Today ankh has `check`. The rest is planned, in this order:
 ankh is a single bash script, and it handles your gpg key and your pass store. **Read it before you run it**, and install a release, not whatever `main` holds today:
 
 ```sh
-git clone https://git.krypta.fi/scripts-shell/ankh.git
+git clone https://codeberg.org/lede/ankh.git
 cd ankh
 git checkout <release tag>
 less ankh
@@ -33,7 +33,7 @@ make install-completions    # bash, zsh and fish
 
 From 0.1.0, each release also publishes the script with a SHA-256 checksum and a gpg signature. Keep the checksum, or the signing key's fingerprint, somewhere you trust (your offline backup is a good place), and check against it before running a downloaded copy. Checking a signature only needs the public key, so it works on a machine that has none of your secrets yet.
 
-With Nix: `nix run 'git+https://git.krypta.fi/scripts-shell/ankh?ref=<release tag>'`, or `homeManagerModules.default` from the flake.
+With Nix: `nix run 'git+https://codeberg.org/lede/ankh?ref=<release tag>'`, or `homeManagerModules.default` from the flake.
 
 ## Requirements
 
