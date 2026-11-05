@@ -18,16 +18,20 @@ Early. Today ankh has `check`. The rest is planned, in this order:
 
 ## Install
 
-ankh is a single bash script.
+ankh is a single bash script, and it handles your gpg key and your pass store. **Read it before you run it**, and install a release, not whatever `main` holds today:
 
 ```sh
-curl -fsSL https://codeberg.org/lede/ankh/raw/branch/main/install.sh |
-  bash -s -- https://codeberg.org/lede/ankh/raw/branch/main/ankh
+git clone https://codeberg.org/lede/ankh.git
+cd ankh
+git checkout <release tag>
+less ankh
+make install                # into ~/.local/bin
+make install-completions    # bash, zsh and fish
 ```
 
-Or from a clone: `make install` (into `~/.local/bin`), `make install-completions` for bash, zsh and fish.
+From 0.1.0, each release also publishes the script with a SHA-256 checksum and a gpg signature. Keep the checksum, or the signing key's fingerprint, somewhere you trust (your offline backup is a good place), and check against it before running a downloaded copy. Checking a signature only needs the public key, so it works on a machine that has none of your secrets yet.
 
-With Nix: `nix run git+https://codeberg.org/lede/ankh`, or `homeManagerModules.default` from the flake.
+With Nix: `nix run 'git+https://codeberg.org/lede/ankh?ref=<release tag>'`, or `homeManagerModules.default` from the flake.
 
 ## Requirements
 

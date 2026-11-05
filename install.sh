@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
-# Install ankh from a URL or from this directory, into ~/.local/bin.
-# Usage: bash install.sh [<url-of-the-ankh-script>]
+# Install ankh from this directory into ~/.local/bin. Run it from a clone you
+# have read, at a release tag: ankh never downloads itself.
 set -euo pipefail
+
+src="$(dirname "$0")/ankh"
+[[ -f "$src" ]] || {
+  echo "install: run this from the ankh directory" >&2
+  exit 1
+}
 
 BIN="${HOME}/.local/bin/ankh"
 mkdir -p "$(dirname "$BIN")"
-
-if [[ -n "${1:-}" ]]; then
-  curl -fsSL "$1" -o "$BIN"
-elif [[ -f "$(dirname "$0")/ankh" ]]; then
-  cp "$(dirname "$0")/ankh" "$BIN"
-else
-  echo "install: give a URL, or run this from the ankh directory" >&2
-  exit 1
-fi
-
+cp "$src" "$BIN"
 chmod +x "$BIN"
 echo "Installed ankh to $BIN"
 case ":$PATH:" in
