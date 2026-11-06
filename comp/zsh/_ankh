@@ -9,6 +9,11 @@ _ankh() {
     'backup:write a complete, verified backup to keep offline'
     'pass:check, clone or start the pass store'
     'ssh:generate or place an SSH key, or use gpg-agent'
+    'pull:fetch the key, the store and SSH keys from the old machine'
+    'send:give them to the new machine, or print a sealed block to paste'
+    'receive:take what send or send --paste gave'
+    'bundle:write a bundle into an empty directory'
+    'verify:check a downloaded ankh against checksum files'
     'version:print the version'
     'help:show the help'
   )
@@ -41,6 +46,24 @@ _ankh() {
         '(--generate --existing --fido2)--gpg[the authentication subkey of the gpg key, through gpg-agent]' \
         '(--generate --existing --gpg)--fido2[an ed25519-sk key on a security key]' \
         '--no-passphrase[no passphrase on a generated key]'
+      ;;
+    pull | send | bundle)
+      _arguments \
+        '--with-primary[the primary key too, not only the subkeys]' \
+        '--key[the key]:fingerprint:' \
+        '--remote-ankh[how to run ankh on the other machine]:command:' \
+        '--paste[send: print a sealed block instead]' \
+        '--qr[send --paste: also as a QR code]' \
+        '*:what:(key pass ssh)'
+      ;;
+    receive) _arguments '1:bundle directory or pasted file:_files' ;;
+    verify)
+      _arguments \
+        '*--checkpoint[a checksum file: URL or file]:checkpoint:_files' \
+        '--no-default-checkpoints[only the checkpoints given]' \
+        '--as[the name in the checksum files]:name:' \
+        '--insecure-skip-verify[go on when none can be reached]' \
+        '1:file:_files'
       ;;
     backup)
       _arguments \

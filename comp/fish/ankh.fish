@@ -25,3 +25,20 @@ complete -c ankh -n '__fish_seen_subcommand_from ssh' -l existing -r -F -d 'An e
 complete -c ankh -n '__fish_seen_subcommand_from ssh' -l gpg -d "The gpg key's authentication subkey, through gpg-agent"
 complete -c ankh -n '__fish_seen_subcommand_from ssh' -l fido2 -d 'An ed25519-sk key on a security key'
 complete -c ankh -n '__fish_seen_subcommand_from ssh' -l no-passphrase -d 'No passphrase on a generated key'
+complete -c ankh -n __fish_use_subcommand -a pull -d 'Fetch the key, the store and SSH keys from the old machine'
+complete -c ankh -n __fish_use_subcommand -a send -d 'Give them to the new machine, or print a sealed block to paste'
+complete -c ankh -n __fish_use_subcommand -a receive -d 'Take what send or send --paste gave'
+complete -c ankh -n __fish_use_subcommand -a bundle -d 'Write a bundle into an empty directory'
+complete -c ankh -n __fish_use_subcommand -a verify -d 'Check a downloaded ankh against checksum files'
+complete -c ankh -n '__fish_seen_subcommand_from pull send bundle' -a 'key pass ssh'
+complete -c ankh -n '__fish_seen_subcommand_from pull send bundle' -l with-primary -d 'The primary key too, not only the subkeys'
+complete -c ankh -n '__fish_seen_subcommand_from pull send bundle' -l key -r -d 'The key'
+complete -c ankh -n '__fish_seen_subcommand_from pull send' -l remote-ankh -r -d 'How to run ankh on the other machine'
+complete -c ankh -n '__fish_seen_subcommand_from send' -l paste -d 'Print a sealed block instead'
+complete -c ankh -n '__fish_seen_subcommand_from send' -l qr -d 'Also as a QR code'
+complete -c ankh -n '__fish_seen_subcommand_from receive' -F
+complete -c ankh -n '__fish_seen_subcommand_from verify' -F
+complete -c ankh -n '__fish_seen_subcommand_from verify' -l checkpoint -r -F -d 'A checksum file: URL or file'
+complete -c ankh -n '__fish_seen_subcommand_from verify' -l no-default-checkpoints -d 'Only the checkpoints given'
+complete -c ankh -n '__fish_seen_subcommand_from verify' -l as -r -d 'The name in the checksum files'
+complete -c ankh -n '__fish_seen_subcommand_from verify' -l insecure-skip-verify -d 'Go on when none can be reached'

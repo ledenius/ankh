@@ -78,6 +78,29 @@ Commands:
                          directory (defaults: its own name, ~/.ssh); backs
                          file keys up into pass as ssh/<name>/key
   init                   check, then key, pass and ssh, then check again
+  pull <user@host> [key] [pass] [ssh] [--with-primary] [--key <fpr>]
+                         On the new machine: fetch them from the old one over
+                         SSH (the password asked once; rsync, or scp without
+                         it). Default: all three, the key as subkeys only
+  send <user@host> [key] [pass] [ssh] [--with-primary] [--key <fpr>]
+                         The same, run on the old machine
+                         Both take --remote-ankh <cmd>: how to run ankh on
+                         the other machine (default ankh)
+  send --paste [key] [ssh] [--qr]
+                         Print a block sealed with a one-time passphrase, to
+                         paste (or scan) on the new machine; no network needed
+  receive [<dir> | <file>]
+                         Take what send or send --paste gave: a bundle
+                         directory, a file holding the block, or a paste
+  bundle <dir> [key] [pass] [ssh] [--with-primary] [--key <fpr>]
+                         Write a bundle into an empty directory (what pull
+                         runs on the old machine)
+  verify <file> [--checkpoint <url|file>]... [--no-default-checkpoints]
+         [--as <name>] [--insecure-skip-verify]
+                         Check a downloaded ankh against checksum files: the
+                         release's on the public mirrors, and any you give.
+                         A mismatch stops; an unreachable one only warns;
+                         none confirming stops
   version                Print ankh's version
   help                   Show this help
 
@@ -92,6 +115,7 @@ Options:
 Environment:
   GNUPGHOME              gpg home (default ~/.gnupg)
   PASSWORD_STORE_DIR     pass store (default ~/.password-store)
+  ANKH_SSH               the ssh program for pull and send (default ssh)
 USAGE
 }
 
@@ -153,8 +177,9 @@ _check_tools() {
     [paperkey]="a printable copy of the secret key in backups"
     [ykman]="YubiKey touch policy"
     [qrencode]="QR codes for pasted bundles"
+    [curl]="fetching checkpoints for ankh verify; wget is used without it"
   )
-  for t in rsync paperkey ykman qrencode; do
+  for t in rsync paperkey ykman qrencode curl; do
     if command -v "$t" >/dev/null 2>&1; then
       v="$(_tool_version "$t")"
       _ok "$t${v:+ $v}"
@@ -539,6 +564,7 @@ SSH_PATH=""
 declare -a ANKH_TMP=()
 
 _cleanup() {
+  [[ ${#ANKH_REMOTE_TMP[@]} -gt 0 ]] && _remote_cleanup
   local d
   for d in "${ANKH_TMP[@]}"; do
     [[ -d "$d" ]] || continue
@@ -1228,16 +1254,24 @@ cmd_pass() {
 # --- ssh -------------------------------------------------------------------
 
 _ssh_place() {
-  # _ssh_place <default name>: asks where the key goes. Sets SSH_PATH.
-  local default_name="$1"
-  local ssh_name="${ssh_name:-}" ssh_dir="${ssh_dir:-}"
-  prompt ssh_name "Key name" "$default_name"
-  prompt ssh_dir "Directory" "$HOME/.ssh"
-  [[ "$ssh_name" != */* ]] || _die "a key name can't contain /"
-  mkdir -p "$ssh_dir"
-  chmod 700 "$ssh_dir"
-  SSH_PATH="$ssh_dir/$ssh_name"
-  [[ ! -e "$SSH_PATH" && ! -e "$SSH_PATH.pub" ]] || _die "$SSH_PATH exists already; choose another name"
+  # _ssh_place <default name> [default dir] [name var] [dir var]: asks where
+  # the key goes; with -y the answers come from the named variables (ssh_name
+  # and ssh_dir unless given). Asks again if the place is taken. Sets SSH_PATH.
+  local default_name="$1" default_dir="${2:-$HOME/.ssh}"
+  local _sp_nv="${3:-ssh_name}" _sp_dv="${4:-ssh_dir}"
+  local _sp_name _sp_dir
+  while true; do
+    _sp_name="${!_sp_nv:-}" _sp_dir="${!_sp_dv:-}"
+    prompt _sp_name "Key name" "$default_name"
+    prompt _sp_dir "Directory" "$default_dir"
+    [[ "$_sp_name" != */* ]] || _die "a key name can't contain /"
+    SSH_PATH="$_sp_dir/$_sp_name"
+    [[ -e "$SSH_PATH" || -e "$SSH_PATH.pub" ]] || break
+    [[ $ANKH_YES -eq 1 ]] && _die "$SSH_PATH exists already; choose another name"
+    _say "$SSH_PATH exists already; choose another name"
+  done
+  mkdir -p "$_sp_dir"
+  chmod 700 "$_sp_dir"
 }
 
 _ssh_to_pass() {
@@ -1398,6 +1432,468 @@ cmd_ssh() {
   printf 'ssh %s\n' "$SSH_PATH"
 }
 
+# --- moving between machines -----------------------------------------------
+# A bundle is a directory: a manifest, the key (subkeys.asc, or secret.asc with
+# --with-primary), public.asc, ownertrust.txt, ssh/ (key pairs laid out as in
+# ~/.ssh) and the store (a git bundle, or a tar when it isn't a repository).
+# pull and send move it over SSH; send --paste seals it with a one-time
+# passphrase instead, for copy and paste.
+
+ANKH_SSH="${ANKH_SSH:-ssh}"
+declare -a SSH_OPTS=()
+declare -a ANKH_REMOTE_TMP=()
+declare -a MOVE_PARTS=()
+MOVE_HOST="" MOVE_FULL=0 MOVE_REMOTE_ANKH="ankh" MOVE_PASTE=0 MOVE_QR=0
+
+_move_args() {
+  # Parses [host] [key] [pass] [ssh] and the options pull and send share.
+  MOVE_PARTS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    key | pass | ssh) MOVE_PARTS+=("$1") ;;
+    --with-primary) MOVE_FULL=1 ;;
+    --key)
+      gpg_fpr="${2:-}"
+      [[ -n "$gpg_fpr" ]] || _die "--key needs a fingerprint"
+      shift
+      ;;
+    --remote-ankh)
+      MOVE_REMOTE_ANKH="${2:-}"
+      [[ -n "$MOVE_REMOTE_ANKH" ]] || _die "--remote-ankh needs a command"
+      shift
+      ;;
+    --paste) MOVE_PASTE=1 ;;
+    --qr) MOVE_QR=1 ;;
+    -*) _die "unknown option '$1'" ;;
+    *)
+      [[ -z "$MOVE_HOST" ]] || _die "one host only (got $MOVE_HOST and $1)"
+      MOVE_HOST="$1"
+      ;;
+    esac
+    shift
+  done
+  if [[ ${#MOVE_PARTS[@]} -eq 0 ]]; then
+    if [[ $MOVE_PASTE -eq 1 ]]; then MOVE_PARTS=(key ssh); else MOVE_PARTS=(key pass ssh); fi
+  fi
+}
+
+_has_part() {
+  local p
+  for p in "${MOVE_PARTS[@]}"; do [[ "$p" == "$1" ]] && return 0; done
+  return 1
+}
+
+_bundle_write() {
+  # _bundle_write <dir>: the parts in MOVE_PARTS, from this machine.
+  local dir="$1" fpr=""
+  if _has_part key || _has_part pass; then _pick_key fpr; fi
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  {
+    echo "ankh-bundle 1"
+    echo "fpr $fpr"
+    echo "parts ${MOVE_PARTS[*]}"
+  } >"$dir/manifest"
+  if _has_part key; then
+    _say "exporting $fpr; gpg-agent may ask for the passphrase"
+    gpg --armor --export "$fpr" >"$dir/public.asc"
+    if [[ $MOVE_FULL -eq 1 ]]; then
+      _primary_here "$fpr" || _die "--with-primary: the primary key isn't on this machine"
+      gpg --armor --export-secret-keys "$fpr" >"$dir/secret.asc" || _die "export failed"
+    else
+      gpg --armor --export-secret-subkeys "$fpr" >"$dir/subkeys.asc" || _die "export failed"
+    fi
+    gpg --export-ownertrust 2>/dev/null | grep "^$fpr:" >"$dir/ownertrust.txt" ||
+      printf '%s:6:\n' "$fpr" >"$dir/ownertrust.txt"
+  fi
+  if _has_part pass; then
+    [[ -f "$ANKH_STORE/.gpg-id" ]] || _die "no pass store at $ANKH_STORE"
+    if git -C "$ANKH_STORE" rev-parse --git-dir >/dev/null 2>&1; then
+      if [[ -n "$(git -C "$ANKH_STORE" status --porcelain 2>/dev/null)" ]]; then
+        _say "warning: the store has uncommitted changes; they aren't moved"
+      fi
+      git -C "$ANKH_STORE" bundle create "$dir/store.bundle" --all 2>/dev/null ||
+        _die "could not bundle the store"
+      git -C "$ANKH_STORE" remote get-url origin >"$dir/store-remote.txt" 2>/dev/null || true
+    else
+      tar -C "$ANKH_STORE" -cf "$dir/store.tar" .
+    fi
+  fi
+  if _has_part ssh; then
+    local n
+    n="$(_backup_ssh "$dir")"
+    _say "$n SSH key pair(s) in the bundle"
+  fi
+  umask "$old_umask"
+}
+
+_bundle_store() {
+  # The store part of a bundle, into ANKH_STORE.
+  local dir="$1" fpr="$2"
+  if [[ -f "$ANKH_STORE/.gpg-id" ]]; then
+    _store_recipients_ok || _die "a store for another key is at $ANKH_STORE already"
+    _say "a store is here already: the bundle's store is skipped"
+    return 0
+  fi
+  if [[ -e "$ANKH_STORE" && -n "$(ls -A "$ANKH_STORE" 2>/dev/null)" ]]; then
+    _die "$ANKH_STORE exists but isn't a pass store"
+  fi
+  if [[ -f "$dir/store.bundle" ]]; then
+    git clone -q "$dir/store.bundle" "$ANKH_STORE" 2>/dev/null || _die "could not clone the store from the bundle"
+    local url=""
+    [[ -f "$dir/store-remote.txt" ]] && url="$(head -n 1 "$dir/store-remote.txt")"
+    if [[ -n "$url" ]]; then
+      git -C "$ANKH_STORE" remote set-url origin "$url"
+      _say "the store's remote is $url, as on the old machine"
+    else
+      git -C "$ANKH_STORE" remote remove origin
+    fi
+  elif [[ -f "$dir/store.tar" ]]; then
+    mkdir -p "$ANKH_STORE"
+    chmod 700 "$ANKH_STORE"
+    tar -C "$ANKH_STORE" -xf "$dir/store.tar"
+  else
+    _die "the bundle has no store"
+  fi
+  if [[ -n "$fpr" ]] && git -C "$ANKH_STORE" rev-parse --git-dir >/dev/null 2>&1; then
+    _store_git_identity "$fpr"
+  fi
+  _store_recipients_ok || _die "the store is encrypted to keys this machine doesn't have"
+  _pass_test_decrypt || _die "the test decrypt failed"
+  _say "store at $ANKH_STORE"
+}
+
+_bundle_ssh() {
+  # Places each key pair, asking its name and directory (defaults: as it was).
+  local dir="$1" priv rel name target
+  [[ -d "$dir/ssh" ]] || return 0
+  while IFS= read -r priv; do
+    [[ -f "$priv.pub" ]] || continue
+    rel="$(dirname "${priv#"$dir/ssh"}")"
+    [[ "$rel" == / || "$rel" == . ]] && rel=""
+    name="$(basename "$priv")"
+    target="$HOME/.ssh$rel/$name"
+    if [[ -f "$target" ]] && cmp -s "$priv" "$target"; then
+      _say "$target is here already"
+      continue
+    fi
+    _say "SSH key $name"
+    _ssh_place "$name" "$HOME/.ssh$rel" _none_name _none_dir
+    cp "$priv" "$SSH_PATH"
+    cp "$priv.pub" "$SSH_PATH.pub"
+    chmod 600 "$SSH_PATH"
+    chmod 644 "$SSH_PATH.pub"
+    _say "placed $SSH_PATH"
+  done < <(find "$dir/ssh" -type f ! -name '*.pub' | LC_ALL=C sort)
+}
+
+_bundle_apply() {
+  # _bundle_apply <dir>: the key first, then the store, then SSH.
+  local dir="$1" fpr parts
+  [[ "$(head -n 1 "$dir/manifest" 2>/dev/null)" == "ankh-bundle 1" ]] || _die "$dir is not an ankh bundle"
+  fpr="$(awk '$1=="fpr"{print $2}' "$dir/manifest")"
+  parts="$(awk '$1=="parts"{$1=""; print}' "$dir/manifest")"
+  local -a MOVE_PARTS
+  read -ra MOVE_PARTS <<<"$parts"
+  if _has_part key; then
+    local file="$dir/subkeys.asc"
+    [[ -f "$dir/secret.asc" ]] && file="$dir/secret.asc"
+    _key_import "$file"
+    [[ "$KEY_FPR" == "$fpr" ]] || _die "the bundle's key is $KEY_FPR, its manifest says $fpr"
+    gpg --import-ownertrust "$dir/ownertrust.txt" 2>/dev/null
+    _say "key $fpr imported$([[ -f "$dir/secret.asc" ]] && echo ', primary included' || echo ', subkeys only')"
+  fi
+  if _has_part pass; then _bundle_store "$dir" "$fpr"; fi
+  if _has_part ssh; then _bundle_ssh "$dir"; fi
+  printf 'received %s\n' "${MOVE_PARTS[*]}"
+}
+
+# --- moving: the SSH side --------------------------------------------------
+
+_ssh_master() {
+  # One SSH connection for every step, so a password is asked once.
+  local t
+  _tmpdir t
+  SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$t/cm-%C" -o ControlPersist=120)
+}
+
+_rsh() {
+  # _rsh [-t] <command...>: runs on MOVE_HOST; -t gives it the terminal.
+  local -a tty=()
+  if [[ "${1:-}" == -t ]]; then
+    shift
+    [[ $ANKH_YES -eq 0 ]] && tty=(-t)
+  fi
+  "$ANKH_SSH" "${SSH_OPTS[@]}" "${tty[@]}" "$MOVE_HOST" "$@"
+}
+
+_remote_tmpdir() {
+  # _remote_tmpdir <var>: a private directory on MOVE_HOST, removed at exit.
+  local _rt_var="$1" _rt_dir
+  # shellcheck disable=SC2016 # expanded by the other machine's sh
+  local _rt_sh='umask 077; d="${XDG_RUNTIME_DIR:-/tmp}"; [ -d "$d" ] && [ -w "$d" ] || d=/tmp; mktemp -d "$d/ankh-move.XXXXXX"'
+  _rt_dir="$(_rsh sh -s <<<"$_rt_sh")" || _die "could not reach $MOVE_HOST"
+  [[ "$_rt_dir" =~ ^/[A-Za-z0-9/._-]+$ ]] || _die "unexpected answer from $MOVE_HOST: $_rt_dir"
+  ANKH_REMOTE_TMP+=("$MOVE_HOST"$'\t'"$_rt_dir")
+  printf -v "$_rt_var" '%s' "$_rt_dir"
+}
+
+_remote_cleanup() {
+  local e
+  for e in "${ANKH_REMOTE_TMP[@]}"; do
+    MOVE_HOST="${e%%$'\t'*}"
+    _rsh rm -rf "${e#*$'\t'}" </dev/null >/dev/null 2>&1 || true
+  done
+  ANKH_REMOTE_TMP=()
+  if [[ ${#SSH_OPTS[@]} -gt 0 && -n "$MOVE_HOST" ]]; then
+    "$ANKH_SSH" "${SSH_OPTS[@]}" -O exit "$MOVE_HOST" >/dev/null 2>&1 || true
+  fi
+}
+
+_copy() {
+  # _copy <from> <to>: one side is host:path. rsync when both ends have it.
+  if command -v rsync >/dev/null 2>&1 && _rsh command -v rsync </dev/null >/dev/null 2>&1; then
+    rsync -a -e "$ANKH_SSH ${SSH_OPTS[*]}" "$1" "$2"
+  else
+    scp -q -r -p -S "$ANKH_SSH" "${SSH_OPTS[@]}" "$1" "$2"
+  fi
+}
+
+_remote_args() {
+  # The ankh command line for the other machine.
+  REMOTE_ARGS=()
+  [[ $ANKH_YES -eq 1 ]] && REMOTE_ARGS+=(-y)
+  REMOTE_ARGS+=("$@")
+}
+
+cmd_pull() {
+  _move_args "$@"
+  [[ -n "$MOVE_HOST" ]] || _die "usage: ankh pull <user@host> [key] [pass] [ssh] [--with-primary] [--key <fpr>]"
+  [[ $MOVE_PASTE -eq 0 ]] || _die "--paste is for send"
+  _ssh_master
+  local rdir t
+  _remote_tmpdir rdir
+  local -a REMOTE_ARGS
+  local -a opts=("${MOVE_PARTS[@]}")
+  [[ $MOVE_FULL -eq 1 ]] && opts+=(--with-primary)
+  [[ -n "${gpg_fpr:-}" ]] && opts+=(--key "$gpg_fpr")
+  _remote_args bundle "$rdir/bundle" "${opts[@]}"
+  _say "on $MOVE_HOST: writing a bundle of ${MOVE_PARTS[*]} (its gpg-agent may ask for the passphrase)"
+  # shellcheck disable=SC2086 # --remote-ankh may be a command with arguments
+  _rsh -t $MOVE_REMOTE_ANKH "${REMOTE_ARGS[@]}" || _die "the bundle on $MOVE_HOST failed"
+  _tmpdir t
+  _copy "$MOVE_HOST:$rdir/bundle" "$t/" || _die "copying the bundle failed"
+  _remote_cleanup
+  _bundle_apply "$t/bundle"
+}
+
+_one_time_passphrase() {
+  # 24 characters from a 32-letter alphabet (120 bits), in groups of four.
+  local abc="abcdefghijkmnpqrstuvwxyz23456789" out="" b i=0
+  for b in $(od -An -N24 -tu1 /dev/urandom); do
+    [[ $i -gt 0 && $((i % 4)) -eq 0 ]] && out+="-"
+    out+="${abc:$((b % 32)):1}"
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+_send_paste() {
+  _has_part pass && _die "the store is too big to paste: clone it (ankh pass --clone) or use pull or send"
+  local t pw
+  _tmpdir t
+  _bundle_write "$t/bundle"
+  pw="$(_one_time_passphrase)"
+  tar -C "$t/bundle" -czf - . |
+    gpg --batch --quiet --no-symkey-cache --pinentry-mode loopback --passphrase-fd 3 \
+      --armor --symmetric --output "$t/bundle.asc" 3< <(printf '%s\n' "$pw") || _die "sealing failed"
+  cat "$t/bundle.asc"
+  if [[ $MOVE_QR -eq 1 ]]; then
+    command -v qrencode >/dev/null 2>&1 || _die "--qr needs qrencode"
+    qrencode -t ANSIUTF8 <"$t/bundle.asc" >&2 || _say "the bundle is too big for one QR code: paste it instead"
+  fi
+  _say "on the new machine: ankh receive, then paste the block above"
+  _say "one-time passphrase (shown once; give it by another channel than the block):"
+  printf '\n    %s\n\n' "$pw" >&2
+}
+
+cmd_send() {
+  _move_args "$@"
+  if [[ $MOVE_PASTE -eq 1 ]]; then
+    [[ -z "$MOVE_HOST" ]] || _die "--paste takes no host"
+    _send_paste
+    return 0
+  fi
+  [[ -n "$MOVE_HOST" ]] || _die "usage: ankh send <user@host> [key] [pass] [ssh] [--with-primary] | ankh send --paste [key] [ssh] [--qr]"
+  local t rdir
+  _tmpdir t
+  _bundle_write "$t/bundle"
+  _ssh_master
+  _remote_tmpdir rdir
+  _copy "$t/bundle" "$MOVE_HOST:$rdir/" || _die "copying the bundle failed"
+  local -a REMOTE_ARGS
+  _remote_args receive "$rdir/bundle"
+  _say "on $MOVE_HOST: receiving ${MOVE_PARTS[*]}"
+  # shellcheck disable=SC2086 # --remote-ankh may be a command with arguments
+  _rsh -t $MOVE_REMOTE_ANKH "${REMOTE_ARGS[@]}" || _die "receiving on $MOVE_HOST failed"
+  _remote_cleanup
+  printf 'sent %s to %s\n' "${MOVE_PARTS[*]}" "$MOVE_HOST"
+}
+
+cmd_bundle() {
+  local dir=""
+  local -a rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    key | pass | ssh | --with-primary) rest+=("$1") ;;
+    --key)
+      rest+=("$1" "${2:-}")
+      shift
+      ;;
+    -*) _die "bundle: unknown option '$1'" ;;
+    *)
+      [[ -z "$dir" ]] || _die "bundle: one directory only"
+      dir="$1"
+      ;;
+    esac
+    shift
+  done
+  [[ -n "$dir" ]] || _die "usage: ankh bundle <dir> [key] [pass] [ssh] [--with-primary] [--key <fpr>]"
+  if [[ -e "$dir" ]]; then
+    [[ -d "$dir" && -z "$(ls -A "$dir")" ]] || _die "$dir exists and isn't an empty directory"
+  fi
+  _move_args "${rest[@]}"
+  _bundle_write "$dir"
+  printf 'bundle %s\n' "$dir"
+}
+
+cmd_receive() {
+  local src="${1:-}"
+  [[ $# -le 1 ]] || _die "usage: ankh receive [<bundle dir> | <pasted file>]"
+  if [[ -n "$src" && -d "$src" ]]; then
+    _bundle_apply "$src"
+    return 0
+  fi
+  local t
+  _tmpdir t
+  if [[ -n "$src" ]]; then
+    [[ -f "$src" ]] || _die "$src: no such file or directory"
+    cp "$src" "$t/bundle.asc"
+  else
+    [[ -t 0 ]] && _say "paste the block from ankh send --paste, then Ctrl+D:"
+    cat >"$t/bundle.asc"
+  fi
+  grep -q -- '-----BEGIN PGP MESSAGE-----' "$t/bundle.asc" || _die "that isn't a block from ankh send --paste"
+  mkdir -m 700 "$t/bundle"
+  _say "opening it: gpg-agent asks for the one-time passphrase"
+  gpg --quiet --no-symkey-cache --decrypt "$t/bundle.asc" 2>/dev/null </dev/null | tar -xz -C "$t/bundle" ||
+    _die "could not open the block (a wrong passphrase, or a damaged paste)"
+  _bundle_apply "$t/bundle"
+}
+
+# --- verify ------------------------------------------------------------------
+# A checkpoint is a URL or a file in sha256sum format. A mismatch stops; one
+# that can't be reached, or doesn't list the file, is a warning; none that
+# confirms it stops, unless --insecure-skip-verify.
+
+_default_checkpoints() {
+  local tag="$1"
+  printf '%s\n' \
+    "https://codeberg.org/lede/ankh/releases/download/$tag/SHA256SUMS" \
+    "https://github.com/lede/ankh/releases/download/$tag/SHA256SUMS" \
+    "https://gitlab.com/lede/ankh/-/releases/$tag/downloads/SHA256SUMS"
+}
+
+_fetch_checkpoint() {
+  case "$1" in
+  *://*)
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL --max-time 20 --max-filesize 1048576 "$1" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q -T 20 -O - "$1" 2>/dev/null
+    else
+      return 1
+    fi
+    ;;
+  *) [[ -f "$1" && -r "$1" ]] && cat "$1" ;;
+  esac
+}
+
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+cmd_verify() {
+  local file="" name="" defaults=1 skip=0
+  local -a cps=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --checkpoint)
+      [[ -n "${2:-}" ]] || _die "--checkpoint needs a URL or a file"
+      cps+=("$2")
+      shift
+      ;;
+    --as)
+      name="${2:-}"
+      shift
+      ;;
+    --no-default-checkpoints) defaults=0 ;;
+    --insecure-skip-verify) skip=1 ;;
+    -*) _die "verify: unknown option '$1'" ;;
+    *)
+      [[ -z "$file" ]] || _die "verify: one file only"
+      file="$1"
+      ;;
+    esac
+    shift
+  done
+  [[ -n "$file" ]] || _die "usage: ankh verify <file> [--checkpoint <url|file>]... [--no-default-checkpoints] [--as <name>]"
+  [[ -f "$file" ]] || _die "$file: no such file"
+  [[ -n "$name" ]] || name="$(basename "$file")"
+  if [[ $defaults -eq 1 ]]; then
+    local ver
+    ver="$(sed -n 's/^ANKH_VERSION="\([0-9A-Za-z.+-]*\)"$/\1/p' "$file" | head -n 1)"
+    if [[ -n "$ver" ]]; then
+      mapfile -t -O "${#cps[@]}" cps < <(_default_checkpoints "v$ver")
+    else
+      _say "warning: no version found in $file: the default checkpoints aren't used"
+    fi
+  fi
+  [[ ${#cps[@]} -gt 0 ]] || _die "no checkpoints: give one with --checkpoint"
+  local sum cp body listed confirmed=0
+  sum="$(_sha256 "$file")"
+  _say "$name: sha256 $sum"
+  for cp in "${cps[@]}"; do
+    if ! body="$(_fetch_checkpoint "$cp")"; then
+      _say "warning: unreachable: $cp"
+      continue
+    fi
+    listed="$(awk -v n="$name" '$2 == n || $2 == "*" n {print tolower($1)}' <<<"$body")"
+    if [[ -z "$listed" ]]; then
+      _say "warning: $cp doesn't list $name"
+    elif [[ "$(sort -u <<<"$listed")" == "$sum" ]]; then
+      _say "ok: $cp"
+      confirmed=$((confirmed + 1))
+    else
+      _die "MISMATCH: $cp lists another checksum for $name. Do not run it."
+    fi
+  done
+  if [[ $confirmed -eq 0 ]]; then
+    [[ $skip -eq 1 ]] || _die "no checkpoint confirmed $name: not verified"
+    _say "warning: NOT verified (--insecure-skip-verify)"
+    printf 'unverified %s\n' "$file"
+    return 0
+  fi
+  printf 'verified %s (%d checkpoint(s))\n' "$file" "$confirmed"
+}
+
 # --- init --------------------------------------------------------------------
 
 cmd_init() {
@@ -1449,6 +1945,26 @@ main() {
   init)
     shift
     cmd_init "$@"
+    ;;
+  pull)
+    shift
+    cmd_pull "$@"
+    ;;
+  send)
+    shift
+    cmd_send "$@"
+    ;;
+  receive)
+    shift
+    cmd_receive "$@"
+    ;;
+  bundle)
+    shift
+    cmd_bundle "$@"
+    ;;
+  verify)
+    shift
+    cmd_verify "$@"
     ;;
   version | --version)
     printf 'ankh %s\n' "$ANKH_VERSION"

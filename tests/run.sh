@@ -393,6 +393,195 @@ check "init leaves a key, a store and an SSH key" "1 1 1" \
      [[ -f "$d8/store/.gpg-id" ]] && echo -n 1; echo -n ' '
      [[ -f "$d8/home/.ssh/id_ed25519" ]] && echo -n 1)"
 
+
+# --- moving between machines ------------------------------------------------
+# The other machine is a second scratch home; a stand-in for ssh runs the
+# command there, so nothing reaches a real host or the real home.
+
+o="" n1="" n2="" n3="" n4="" n5="" n6="" v=""
+new_home o
+mkdir -p "$o/run"
+chmod 700 "$o/run"
+cat >"$o/fakessh" <<'FAKE'
+#!/usr/bin/env bash
+# A stand-in for ssh: runs the command here, in the scratch home $FAKE_REMOTE.
+sftp=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  -O) exit 0 ;;
+  -o | -p | -l | -i | -F | -S | -E | -c | -m | -b | -J | -W | -L | -R | -D | -e) shift 2 ;;
+  -s) sftp=1 && shift ;;
+  --) shift && break ;;
+  -*) shift ;;
+  *) break ;;
+  esac
+done
+shift
+r="$FAKE_REMOTE"
+export HOME="$r/home" GNUPGHOME="$r/gnupg" PASSWORD_STORE_DIR="$r/store" XDG_RUNTIME_DIR="$r/run"
+unset SSH_AUTH_SOCK GPG_TTY
+[[ $sftp -eq 1 ]] && exec "$FAKE_SFTP_SERVER"
+[[ -n "${FAKE_NO_RSYNC:-}" && "$*" == "command -v rsync" ]] && exit 1
+exec sh -c "$*"
+FAKE
+chmod +x "$o/fakessh"
+FAKE_SFTP_SERVER="$(dirname "$(readlink -f "$(command -v ssh)")")/../libexec/sftp-server"
+export FAKE_SFTP_SERVER
+
+ofpr="$(make_key "$o" "Old Machine <old@example.invalid>")"
+make_store "$o" "$ofpr"
+git -C "$o/store" init -q
+git -C "$o/store" config user.email old@example.invalid
+git -C "$o/store" config user.name "Old Machine"
+HOME="$o/home" GNUPGHOME="$o/gnupg" PASSWORD_STORE_DIR="$o/store" pass git init >/dev/null 2>&1
+git -C "$o/store" remote add origin https://git.example.invalid/store.git
+mkdir -p "$o/home/.ssh/keys"
+chmod 700 "$o/home/.ssh"
+ssh-keygen -q -t ed25519 -N '' -C old -f "$o/home/.ssh/id_ed25519" >/dev/null
+ssh-keygen -q -t ed25519 -N '' -C work -f "$o/home/.ssh/keys/work" >/dev/null
+
+move() {
+  # move <here> <there> <ankh args...>: ankh in <here>, ssh reaching <there>.
+  local here="$1" there="$2"
+  shift 2
+  ANKH_SSH="$o/fakessh" FAKE_REMOTE="$there" run_ankh "$here" "$@" --remote-ankh "bash $ANKH"
+}
+
+new_home n1
+out="$(move "$n1" "$o" -y pull old.example.invalid)"
+rc=$?
+check "pull ends well" "0" "$rc"
+check_contains "pull brings the key, the store and SSH" "received key pass ssh" "$out"
+check "pull imports the subkeys only" "#" \
+  "$(GNUPGHOME="$n1/gnupg" gpg --with-colons --list-secret-keys "$ofpr" 2>/dev/null | awk -F: '/^sec/{print $15}')"
+check "pull sets ownertrust" "$ofpr:6:" "$(GNUPGHOME="$n1/gnupg" gpg --export-ownertrust 2>/dev/null | grep "^$ofpr:")"
+check "pull clones the store" "1" "$([[ -f "$n1/store/.gpg-id" && -f "$n1/store/example.invalid/login.gpg" ]] && echo 1)"
+check "the store keeps the old machine's remote" "https://git.example.invalid/store.git" \
+  "$(git -C "$n1/store" remote get-url origin 2>/dev/null)"
+check "the store decrypts here" "canary-value-must-not-appear" \
+  "$(HOME="$n1/home" GNUPGHOME="$n1/gnupg" PASSWORD_STORE_DIR="$n1/store" pass show example.invalid/login 2>/dev/null)"
+check "pull places the SSH keys as they were" "1 1" \
+  "$(cmp -s "$o/home/.ssh/id_ed25519" "$n1/home/.ssh/id_ed25519" && echo -n 1; echo -n ' '
+     cmp -s "$o/home/.ssh/keys/work" "$n1/home/.ssh/keys/work" && echo -n 1)"
+check "placed private keys are 600" "600" "$(stat -c %a "$n1/home/.ssh/keys/work")"
+check_not_contains "pull never prints a value" "canary-value" "$out"
+check "pull leaves nothing behind on the old machine" "" "$(find "$o/run" -mindepth 1 -maxdepth 1)"
+
+out="$(move "$n1" "$o" -y pull old.example.invalid)"
+rc=$?
+check "pulling again ends well" "0" "$rc"
+check_contains "pulling again skips the store" "the bundle's store is skipped" "$out"
+check_contains "pulling again skips keys already here" "is here already" "$out"
+
+new_home n2
+out="$(FAKE_NO_RSYNC=1 move "$n2" "$o" -y pull old.example.invalid key --with-primary)"
+rc=$?
+check "pull over scp ends well" "0" "$rc"
+check_contains "pull key brings the key only" "received key" "$out"
+check "--with-primary brings the primary too" "1" \
+  "$(GNUPGHOME="$n2/gnupg" gpg --with-colons --list-secret-keys "$ofpr" 2>/dev/null | awk -F: '/^sec/ && $15 != "#" {print 1}')"
+check "pull key leaves the store alone" "0" "$([[ -e "$n2/store" ]] && echo 1 || echo 0)"
+
+new_home n3
+out="$(move "$o" "$n3" -y send new.example.invalid ssh pass key)"
+rc=$?
+check "send ends well" "0" "$rc"
+check_contains "send reports what it sent" "sent ssh pass key to new.example.invalid" "$out"
+check "send gives the new machine the key" "#" \
+  "$(GNUPGHOME="$n3/gnupg" gpg --with-colons --list-secret-keys "$ofpr" 2>/dev/null | awk -F: '/^sec/{print $15}')"
+check "send gives it the store and SSH keys" "1 1" \
+  "$([[ -f "$n3/store/.gpg-id" ]] && echo -n 1; echo -n ' '; [[ -f "$n3/home/.ssh/id_ed25519" ]] && echo -n 1)"
+check "send leaves nothing behind on the new machine" "" "$(find "$o/run" -mindepth 1 -maxdepth 1)"
+
+out="$(run_ankh "$o" -y send --paste pass)"
+rc=$?
+check "send --paste refuses the store" "1" "$rc"
+
+out="$(run_ankh "$o" -y send --paste)"
+rc=$?
+check "send --paste ends well" "0" "$rc"
+pw="$(grep -E '^    [a-z2-9]{4}(-[a-z2-9]{4}){5}$' <<<"$out" | tr -d ' ')"
+check "send --paste shows a one-time passphrase" "1" "$([[ -n "$pw" ]] && echo 1)"
+block="$(sed -n '/-----BEGIN PGP MESSAGE-----/,/-----END PGP MESSAGE-----/p' <<<"$out")"
+check_contains "send --paste prints a sealed block" "-----END PGP MESSAGE-----" "$block"
+check_not_contains "the block holds no readable key" "PRIVATE KEY" "$block"
+
+new_home n4
+with_pinentry "$n4" "$pw"
+printf '%s\n' "$block" >"$n4/paste.asc"
+out="$(run_ankh "$n4" -y receive "$n4/paste.asc")"
+rc=$?
+check "receive opens the block" "0" "$rc"
+check_contains "receive takes the key and SSH" "received key ssh" "$out"
+check "receive imports the subkeys" "#" \
+  "$(GNUPGHOME="$n4/gnupg" gpg --with-colons --list-secret-keys "$ofpr" 2>/dev/null | awk -F: '/^sec/{print $15}')"
+check "receive places the SSH keys" "1" "$(cmp -s "$o/home/.ssh/keys/work" "$n4/home/.ssh/keys/work" && echo 1)"
+
+new_home n5
+with_pinentry "$n5" "not the passphrase"
+printf '%s\n' "$block" >"$n5/paste.asc"
+out="$(run_ankh "$n5" -y receive "$n5/paste.asc")"
+rc=$?
+check "a wrong passphrase stops receive" "1" "$rc"
+check_contains "and says so" "could not open the block" "$out"
+check "and imports nothing" "" "$(GNUPGHOME="$n5/gnupg" gpg --list-secret-keys 2>/dev/null)"
+
+new_home n6
+mkdir -p "$n6/home/.ssh"
+echo "another key" >"$n6/home/.ssh/id_ed25519"
+out="$(move "$n6" "$o" -y pull old.example.invalid ssh)"
+rc=$?
+check "with -y, a taken place for an SSH key stops" "1" "$rc"
+check "and the key there is untouched" "another key" "$(cat "$n6/home/.ssh/id_ed25519")"
+
+mkdir -p "$n6/full"
+touch "$n6/full/x"
+out="$(run_ankh "$o" -y bundle "$n6/full" key)"
+rc=$?
+check "bundle refuses a non-empty directory" "1" "$rc"
+
+# --- verify ------------------------------------------------------------------
+
+new_home v
+cp "$ANKH" "$v/ankh"
+(cd "$v" && sha256sum ankh >good.sums)
+printf '%064d  ankh\n' 0 >"$v/bad.sums"
+printf '%064d  other\n' 0 >"$v/other.sums"
+gone="http://127.0.0.1:9/SHA256SUMS"
+for tool in "ankh verify" "ankh-verify"; do
+  vrun() {
+    if [[ "$tool" == "ankh verify" ]]; then
+      run_ankh "$v" verify "$v/ankh" --no-default-checkpoints "$@"
+    else
+      bash "$here/../ankh-verify" "$v/ankh" --no-default-checkpoints "$@" 2>&1
+    fi
+  }
+  out="$(vrun --checkpoint "$v/good.sums")"
+  check "$tool: a matching checkpoint verifies" "0" "$?"
+  check_contains "$tool: and says so" "verified $v/ankh (1 checkpoint(s))" "$out"
+  out="$(vrun --checkpoint "file://$v/good.sums")"
+  check "$tool: a file:// URL is a checkpoint" "0" "$?"
+  out="$(vrun --checkpoint "$v/good.sums" --checkpoint "$v/bad.sums")"
+  check "$tool: one mismatch is a hard stop" "1" "$?"
+  check_contains "$tool: and says so" "MISMATCH" "$out"
+  out="$(vrun --checkpoint "$gone" --checkpoint "$v/good.sums")"
+  check "$tool: an unreachable checkpoint only warns" "0" "$?"
+  check_contains "$tool: with a warning" "unreachable: $gone" "$out"
+  out="$(vrun --checkpoint "$gone" --checkpoint "$v/missing.sums")"
+  check "$tool: none reachable is a hard stop" "1" "$?"
+  out="$(vrun --checkpoint "$v/other.sums")"
+  check "$tool: a checkpoint not listing the file doesn't confirm it" "1" "$?"
+  check_contains "$tool: and warns" "doesn't list ankh" "$out"
+  out="$(vrun --checkpoint "$gone" --insecure-skip-verify)"
+  check "$tool: --insecure-skip-verify goes on" "0" "$?"
+  check_contains "$tool: loudly" "NOT verified" "$out"
+  out="$(vrun --checkpoint "$v/bad.sums" --insecure-skip-verify)"
+  check "$tool: --insecure-skip-verify never overrides a mismatch" "1" "$?"
+  cp "$v/ankh" "$v/renamed"
+  out="$(vrun --checkpoint "$v/good.sums" --as ankh)"
+  check "$tool: --as names the file in the checksums" "0" "$?"
+done
+check_contains "the default checkpoints are the public mirrors" "codeberg.org/lede/ankh" "$(sed -n '/^_default_checkpoints/,/^}/p' "$ANKH")"
 echo ""
 echo "$pass_count passed, $fail_count failed"
 [[ $fail_count -eq 0 ]]
