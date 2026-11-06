@@ -21,6 +21,7 @@
           runHook preInstall
 
           install -Dm755 ankh "$out/bin/ankh"
+          install -Dm755 ankh-verify "$out/bin/ankh-verify"
           install -Dm644 comp/bash/ankh "$out/share/bash-completion/completions/ankh"
           install -Dm644 comp/zsh/_ankh "$out/share/zsh/site-functions/_ankh"
           install -Dm644 comp/fish/ankh.fish "$out/share/fish/vendor_completions.d/ankh.fish"
@@ -29,7 +30,7 @@
         '';
         postFixup = ''
           wrapProgram "$out/bin/ankh" \
-            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bash pkgs.gnupg pkgs.pass pkgs.git pkgs.openssh pkgs.rsync pkgs.paperkey pkgs.qrencode ]}
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bash pkgs.gnupg pkgs.pass pkgs.git pkgs.openssh pkgs.rsync pkgs.paperkey pkgs.qrencode pkgs.curl ]}
         '';
         meta = with pkgs.lib; {
           description = "Identity bootstrap for a fresh machine";

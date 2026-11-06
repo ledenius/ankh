@@ -12,9 +12,7 @@ ankh is published on [Codeberg](https://codeberg.org/lede/ankh). Any copy can se
 
 ## Status
 
-Early. Today ankh has `init`, `check`, `key`, `backup`, `pass` and `ssh`. Still planned, in this order:
-- moving everything between machines (`pull`, `send`, paste);
-- smartcards (`card`).
+Early. Today ankh has `init`, `check`, `key`, `backup`, `pass`, `ssh`, moving between machines (`pull`, `send`, `receive`) and `verify`. Still planned: smartcards (`card`).
 
 ## Install
 
@@ -24,7 +22,8 @@ ankh is a single bash script, and it handles your gpg key and your pass store. *
 git clone https://codeberg.org/lede/ankh.git
 cd ankh
 git checkout <release tag>
-less ankh
+less ankh ankh-verify
+./ankh-verify               # against the checksums on the mirrors
 make install                # into ~/.local/bin
 make install-completions    # bash, zsh and fish
 ```
@@ -38,7 +37,7 @@ With Nix: `nix run 'git+https://codeberg.org/lede/ankh?ref=<release tag>'`, or `
 | | |
 |---|---|
 | Required | bash 5+, gpg (with gpg-agent and a pinentry), git, pass, OpenSSH (ssh, ssh-keygen, ssh-add, scp) |
-| Optional | rsync (used to copy between machines; scp otherwise), paperkey (printable backups), ykman (YubiKey touch policy), qrencode (QR codes for pasted bundles) |
+| Optional | rsync (used to copy between machines; scp otherwise), paperkey (printable backups), ykman (YubiKey touch policy), qrencode (QR codes for pasted bundles), curl or wget (fetching checkpoints) |
 
 ## init
 
@@ -137,6 +136,42 @@ The secret keys stay protected by the key's passphrase.
 
 - `--encrypt` seals everything into `ankh-backup.tar.gpg` with a passphrase of its own, so a lost stick needs two passphrases. The backup is built and checked in a private scratch directory, in memory (tmpfs) where there is one, and **only the sealed archive is written to the target**. Flash drives remap writes, so files deleted on them can often be recovered: nothing readable should ever land there. The new passphrase is asked twice, then once more to prove the archive opens.
 - `--remove-primary` removes the primary key from this machine once the backup is verified, leaving only the subkeys. Without the flag, ankh asks.
+
+## Moving between machines
+
+```sh
+ankh pull <user@old> [key] [pass] [ssh]   # on the new machine
+ankh send <user@new> [key] [pass] [ssh]   # the same, from the old machine
+ankh send --paste [key] [ssh] [--qr]      # no network between them
+ankh receive                              # on the new machine, then paste
+```
+
+ankh has to be installed on both machines. With no parts named, `pull` and `send` move all three:
+
+- **the key:** its subkeys only, unless `--with-primary` (keep the primary on one machine, or only in the backup). Ownertrust comes along.
+- **the store:** cloned from a git bundle of the old one, keeping its remote. A store already here is left alone.
+- **SSH keys:** every key pair in `~/.ssh` (and `~/.ssh/keys`). For each, ankh asks its name and directory, defaulting to the old ones, and never overwrites a file.
+
+The connection is SSH (a password is fine, asked once for the whole move). Files go through rsync when both machines have it, scp otherwise, via a private directory on the other machine that is removed afterwards. `--remote-ankh <cmd>` says how to run ankh there, if it isn't on that machine's `PATH`.
+
+**Paste** needs no network path at all. `send --paste` prints the key and SSH keys as a block sealed with a one-time passphrase (`gpg --symmetric`), shown once. Copy the block across however you like (`--qr` also draws it as a QR code, if it fits). Give the passphrase by another way than the block. `ankh receive` asks for the block, or takes a file holding it. The store is too big to paste: `ankh pass --clone` it instead.
+
+## verify
+
+```sh
+./ankh-verify [<file>] [--checkpoint <url|file>]... [--no-default-checkpoints] [--as <name>]
+ankh verify <file>     [--checkpoint <url|file>]... [--no-default-checkpoints] [--as <name>]
+```
+
+Checks a downloaded ankh against checksum files ("checkpoints", in `sha256sum` format): by default the release's `SHA256SUMS` on the public mirrors, plus any you give, as URLs or local files. Your own copy of the checksums (in your offline backup, say) is a checkpoint too. `--no-default-checkpoints` uses only yours, so nothing depends on the mirrors.
+
+- **A mismatch on any checkpoint stops.** Don't run the file.
+- A checkpoint that can't be reached, or doesn't list the file, is only a warning.
+- **None confirming it stops**, unless `--insecure-skip-verify`. That never overrides a mismatch.
+
+A script can't vouch for itself, so the first check on a new machine is done by `ankh-verify`, a separate script of about 50 lines: read it, then run it on `ankh`. `ankh verify` does the same from an ankh you already trust, for newer versions.
+
+The mirrors copy one origin, so their checkpoints catch a tampered download host, not a tampered release. The release's gpg signature covers that.
 
 ## Development
 

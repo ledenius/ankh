@@ -13,7 +13,7 @@ _ankh() {
     esac
   done
   if [[ -z "$cmd" ]]; then
-    mapfile -t COMPREPLY < <(compgen -W "-y init check key backup pass ssh version help" -- "$cur")
+    mapfile -t COMPREPLY < <(compgen -W "-y init check key backup pass ssh pull send receive bundle verify version help" -- "$cur")
     return
   fi
   case "$cmd" in
@@ -37,6 +37,26 @@ _ankh() {
     else
       mapfile -t COMPREPLY < <(compgen -W "--generate --existing --gpg --fido2 --no-passphrase" -- "$cur")
     fi
+    ;;
+  pull | send | bundle)
+    case "$prev" in
+    --key | --remote-ankh) ;;
+    *) mapfile -t COMPREPLY < <(compgen -W "key pass ssh --with-primary --key --remote-ankh --paste --qr" -- "$cur") ;;
+    esac
+    ;;
+  receive) mapfile -t COMPREPLY < <(compgen -f -- "$cur") ;;
+  verify)
+    case "$prev" in
+    --checkpoint) mapfile -t COMPREPLY < <(compgen -f -- "$cur") ;;
+    --as) ;;
+    *)
+      if [[ "$cur" == -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "--checkpoint --no-default-checkpoints --as --insecure-skip-verify" -- "$cur")
+      else
+        mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+      fi
+      ;;
+    esac
     ;;
   backup)
     case "$prev" in
