@@ -12,8 +12,7 @@ ankh is published on [Codeberg](https://codeberg.org/lede/ankh). Any copy can se
 
 ## Status
 
-Early. Today ankh has `check`. The rest is planned, in this order:
-- `key` and `backup`;
+Early. Today ankh has `check`, `key` and `backup`. The rest is planned, in this order:
 - `pass`, `ssh` and `init`;
 - moving everything between machines (`pull`, `send`, paste);
 - smartcards (`card`).
@@ -59,6 +58,46 @@ Reports, section by section:
 Each line is `ok`, `warn`, `FAIL` (a required piece is missing or broken) or `--` (for information). The exit status is 1 when anything failed.
 
 `GNUPGHOME` and `PASSWORD_STORE_DIR` are honoured.
+
+## key
+
+```sh
+ankh key                       # choose interactively
+ankh key --existing            # a key already in the keyring
+ankh key --generate
+ankh key --import <file|dir|-> # an armored file, a backup directory, or a paste
+```
+
+- **Generated keys:** an ed25519 primary key that only certifies (default expiry 5y), and ed25519 signing, ed25519 authentication and cv25519 encryption subkeys (default 2y). gpg-agent's pinentry asks for the passphrase: ankh never sees it. You're offered a backup straight away.
+- **From a backup directory:** the subkeys only by default, which is what a daily machine needs. The full key, with its primary, is offered too. Encrypted backups are opened first.
+- In every case the key gets ultimate ownertrust.
+- `ankh -y key` runs without questions, taking its answers from the environment: `key_source` (`existing`, `generate`, `import`), `key_file`, `key_import` (`subkeys`, `full`), `gpg_fpr`, `gpg_name`, `gpg_email`, `gpg_expire`, `gpg_subkey_expire`. Passphrases are still asked by gpg-agent.
+
+## backup
+
+```sh
+ankh backup <dir> [--key <fpr>] [--encrypt] [--remove-primary]
+```
+
+Writes a complete backup into an empty directory: typically a USB stick that then stays in a drawer, never a synced folder (ankh refuses a git work tree).
+
+| File | Contents |
+|---|---|
+| `secret.asc` | the full secret key, primary and all subkeys (only when the primary is on this machine) |
+| `subkeys.asc` | the subkeys only, for daily machines |
+| `public.asc` | the public key |
+| `revocation.asc` | the revocation certificate gpg wrote when the key was made |
+| `ownertrust.txt` | trust settings |
+| `paperkey.txt` | the secret part, for printing (with paperkey installed) |
+| `ssh/` | SSH key pairs from `~/.ssh` (and `~/.ssh/keys`), in the same layout |
+| `README.txt` | the fingerprint, the date, how to restore |
+
+The secret keys stay protected by the key's passphrase.
+
+**Verified before ankh calls it good:** each secret file is imported into a throwaway gpg home, then used to sign and decrypt a test message.
+
+- `--encrypt` seals everything into `ankh-backup.tar.gpg` with a passphrase of its own, so a lost stick needs two passphrases. The backup is built and checked in a private scratch directory, in memory (tmpfs) where there is one, and **only the sealed archive is written to the target**. Flash drives remap writes, so files deleted on them can often be recovered: nothing readable should ever land there. The new passphrase is asked twice, then once more to prove the archive opens.
+- `--remove-primary` removes the primary key from this machine once the backup is verified, leaving only the subkeys. Without the flag, ankh asks.
 
 ## Development
 
