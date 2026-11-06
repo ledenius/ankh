@@ -28,20 +28,9 @@ make install                # into ~/.local/bin
 make install-completions    # bash, zsh and fish
 ```
 
-Each release publishes `ankh`, `ankh-verify`, their checksums (`SHA256SUMS`) and a gpg signature over the checksums (`SHA256SUMS.asc`). `ankh-verify` compares a copy against the checksums on every mirror; the signature also covers a release tampered with at its origin, which the mirrors would copy faithfully:
+Each release publishes `ankh`, `ankh-verify` and their checksums (`SHA256SUMS`). `ankh-verify` compares a copy against the checksums on every mirror. Keep a copy of the checksums somewhere you trust (your offline backup is a good place) and give it as a `--checkpoint` too.
 
-```sh
-gpg --verify SHA256SUMS.asc SHA256SUMS   # signed by the key below
-sha256sum -c SHA256SUMS
-```
-
-The releases are signed by:
-
-```
-BF98 6D66 57FB 89DA 22D5  4E28 93FA 6B48 46DA AF92
-```
-
-Keep this fingerprint, or the checksums, somewhere you trust (your offline backup is a good place). Checking a signature needs only the public key, so it works on a machine that has none of your secrets yet.
+Releases aren't signed yet. The mirrors copy one origin, so until they are, the checksums catch a tampered download host but not a release tampered with at its origin. A gpg signature over `SHA256SUMS`, and the fingerprint to check it against, come in a later release.
 
 With Nix: `nix run 'git+https://codeberg.org/lede/ankh?ref=<release tag>'`, or `homeManagerModules.default` from the flake.
 
