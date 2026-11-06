@@ -4,15 +4,35 @@ _ankh() {
   local -a commands
   commands=(
     'check:report on tools, gpg-agent, keys, the pass store and SSH'
+    'key:choose, generate or import the gpg key'
+    'backup:write a complete, verified backup to keep offline'
     'version:print the version'
     'help:show the help'
   )
-  if (( CURRENT == 2 )); then
-    _describe 'command' commands
-    return
-  fi
-  case "$words[2]" in
-  check) _arguments '--decrypt[also decrypt one entry; the value is discarded]' ;;
+  _arguments -C \
+    '(-y --yes)'{-y,--yes}'[non-interactive: answers from the environment]' \
+    '1:command:->command' \
+    '*::arg:->args'
+  case $state in
+  command) _describe 'command' commands ;;
+  args)
+    case $words[1] in
+    check) _arguments '--decrypt[also decrypt one entry; the value is discarded]' ;;
+    key)
+      _arguments \
+        '(--generate --import)--existing[a key already in the keyring]' \
+        '(--existing --import)--generate[a new key]' \
+        '(--existing --generate)--import[a file, a backup directory or - to paste]:source:_files'
+      ;;
+    backup)
+      _arguments \
+        '--key[the key to back up]:fingerprint:' \
+        '--encrypt[seal the backup with its own passphrase]' \
+        '--remove-primary[then remove the primary key from this machine]' \
+        '1:directory:_directories'
+      ;;
+    esac
+    ;;
   esac
 }
 

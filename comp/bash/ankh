@@ -1,13 +1,42 @@
 # bash completion for ankh
 # shellcheck shell=bash
 _ankh() {
-  local cur="${COMP_WORDS[COMP_CWORD]}"
-  if [[ $COMP_CWORD -eq 1 ]]; then
-    mapfile -t COMPREPLY < <(compgen -W "check version help" -- "$cur")
+  local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD - 1]}"
+  local i cmd=""
+  for ((i = 1; i < COMP_CWORD; i++)); do
+    case "${COMP_WORDS[i]}" in
+    -y | --yes) ;;
+    *)
+      cmd="${COMP_WORDS[i]}"
+      break
+      ;;
+    esac
+  done
+  if [[ -z "$cmd" ]]; then
+    mapfile -t COMPREPLY < <(compgen -W "-y check key backup version help" -- "$cur")
     return
   fi
-  case "${COMP_WORDS[1]}" in
+  case "$cmd" in
   check) mapfile -t COMPREPLY < <(compgen -W "--decrypt" -- "$cur") ;;
+  key)
+    if [[ "$prev" == --import ]]; then
+      mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+    else
+      mapfile -t COMPREPLY < <(compgen -W "--existing --generate --import" -- "$cur")
+    fi
+    ;;
+  backup)
+    case "$prev" in
+    --key) ;;
+    *)
+      if [[ "$cur" == -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "--key --encrypt --remove-primary" -- "$cur")
+      else
+        mapfile -t COMPREPLY < <(compgen -d -- "$cur")
+      fi
+      ;;
+    esac
+    ;;
   esac
 }
 complete -F _ankh ankh

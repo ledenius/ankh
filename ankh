@@ -46,20 +46,42 @@ BANNER
 }
 
 usage() {
-  echo "Usage: ankh <command> [options]"
-  echo ""
-  echo "Commands:"
-  echo "  check [--decrypt]      Report on tools, gpg-agent, keys, the pass store"
-  echo "                         and SSH; changes nothing. --decrypt also decrypts"
-  echo "                         one entry (may ask for the passphrase); the value"
-  echo "                         is discarded, never shown"
-  echo "  version                Print ankh's version"
-  echo "  help                   Show this help"
-  echo ""
-  echo "Environment:"
-  echo "  GNUPGHOME              gpg home (default ~/.gnupg)"
-  echo "  PASSWORD_STORE_DIR     pass store (default ~/.password-store)"
+  cat <<'USAGE'
+Usage: ankh [-y] <command> [options]
+
+Commands:
+  check [--decrypt]      Report on tools, gpg-agent, keys, the pass store
+                         and SSH; changes nothing. --decrypt also decrypts
+                         one entry (may ask for the passphrase); the value
+                         is discarded, never shown
+  key [--existing | --generate | --import <file|dir|->]
+                         Choose the gpg key: one in the keyring, a new one
+                         (an ed25519 primary that only certifies; ed25519
+                         sign and auth and cv25519 encrypt subkeys), or one
+                         from a file, a backup directory or a paste. Sets
+                         ownertrust; offers a backup after generating
+  backup <dir> [--key <fpr>] [--encrypt] [--remove-primary]
+                         Write a complete backup into an empty directory, to
+                         keep offline: the full key, the subkeys, the public
+                         key, revocation, ownertrust, paperkey, SSH keys.
+                         Verified by restoring it into a throwaway gpg home.
+                         --encrypt seals it with its own passphrase;
+                         --remove-primary then leaves only the subkeys here
+  version                Print ankh's version
+  help                   Show this help
+
+Options:
+  -y, --yes              Non-interactive: answers come from the environment
+                         (key_source, key_file, key_import, gpg_fpr, gpg_name,
+                         gpg_email, gpg_expire, gpg_subkey_expire).
+                         Passphrases are always asked by gpg-agent
+
+Environment:
+  GNUPGHOME              gpg home (default ~/.gnupg)
+  PASSWORD_STORE_DIR     pass store (default ~/.password-store)
+USAGE
 }
+
 
 # --- check: report lines ---------------------------------------------------
 # One line per finding: a mark, then the text. FAIL means a required piece is
@@ -491,11 +513,568 @@ cmd_check() {
   [[ $CHECK_FAILS -eq 0 ]]
 }
 
+# --- shared helpers --------------------------------------------------------
+
+ANKH_YES=0
+KEY_FPR=""
+declare -a ANKH_TMP=()
+
+_cleanup() {
+  local d
+  for d in "${ANKH_TMP[@]}"; do
+    [[ -d "$d" ]] || continue
+    local h
+    for h in "$d"/*/; do
+      [[ -d "$h" ]] && GNUPGHOME="$h" gpgconf --kill all >/dev/null 2>&1
+    done
+    rm -rf "$d"
+  done
+  return 0
+}
+trap _cleanup EXIT
+
+_say() { printf 'ankh: %s\n' "$*" >&2; }
+_die() {
+  printf 'ankh: %s\n' "$*" >&2
+  exit 1
+}
+
+_tmpdir() {
+  # A private scratch directory, on tmpfs where there is one; removed at exit.
+  # Its locals are prefixed so they never shadow the caller's variable.
+  local _tmp_var="$1" _tmp_base="${XDG_RUNTIME_DIR:-}" _tmp_dir
+  [[ -n "$_tmp_base" && -d "$_tmp_base" && -w "$_tmp_base" ]] || _tmp_base="/tmp"
+  _tmp_dir="$(mktemp -d "$_tmp_base/ankh.XXXXXX")"
+  chmod 700 "$_tmp_dir"
+  ANKH_TMP+=("$_tmp_dir")
+  printf -v "$_tmp_var" '%s' "$_tmp_dir"
+}
+
+_temp_gnupghome() {
+  # A throwaway gpg home that uses the same pinentry as the real one.
+  local _tgh_var="$1" _tgh_tmp _tgh_home
+  _tmpdir _tgh_tmp
+  _tgh_home="$_tgh_tmp/gnupg"
+  mkdir -m 700 "$_tgh_home"
+  if [[ -f "$ANKH_GNUPGHOME/gpg-agent.conf" ]]; then
+    grep -E '^[[:space:]]*pinentry-program[[:space:]]' "$ANKH_GNUPGHOME/gpg-agent.conf" >"$_tgh_home/gpg-agent.conf" || true
+  fi
+  printf -v "$_tgh_var" '%s' "$_tgh_home"
+}
+
+prompt() {
+  # prompt <var> <label> [default]: with -y, the variable's value from the
+  # environment, else the default.
+  local var="$1" label="$2" default="${3:-}"
+  if [[ $ANKH_YES -eq 1 ]]; then
+    local val="${!var:-$default}"
+    [[ -n "$val" ]] || _die "\$$var is required with -y"
+    printf -v "$var" '%s' "$val"
+    return 0
+  fi
+  local input
+  if [[ -n "$default" ]]; then
+    IFS= read -rp "$label [$default]: " input </dev/tty
+    printf -v "$var" '%s' "${input:-$default}"
+  else
+    IFS= read -rp "$label: " input </dev/tty
+    [[ -n "$input" ]] || _die "$label is required"
+    printf -v "$var" '%s' "$input"
+  fi
+}
+
+_confirm() {
+  # _confirm <question>: yes only when typed; with -y, always no.
+  [[ $ANKH_YES -eq 1 ]] && return 1
+  local ans
+  IFS= read -rp "$1 [y/N] " ans </dev/tty
+  [[ "$ans" == y || "$ans" == Y || "$ans" == yes ]]
+}
+
+# --- keys --------------------------------------------------------------------
+
+_secret_keys() {
+  # One line per secret key: fingerprint, tab, first valid user ID.
+  gpg --with-colons --fixed-list-mode --list-secret-keys 2>/dev/null | awk -F: '
+    /^sec/ { want_fpr = 1; uid_done = 0; next }
+    /^fpr/ && want_fpr { fpr = $10; want_fpr = 0; next }
+    /^uid/ && !uid_done && $2 != "r" { print fpr "\t" $10; uid_done = 1 }
+  '
+}
+
+_primary_field() {
+  # _primary_field <fpr> <n>: field n of the key's sec record.
+  gpg --with-colons --fixed-list-mode --list-secret-keys "$1" 2>/dev/null |
+    awk -F: -v n="$2" '/^sec/{print $n; exit}'
+}
+
+_primary_grip() {
+  gpg --with-colons --fixed-list-mode --with-keygrip --list-secret-keys "$1" 2>/dev/null |
+    awk -F: '/^sec/{s=1; next} /^grp/ && s{print $10; exit}'
+}
+
+_primary_here() {
+  # True when the primary key's secret is on this machine, not a stub or card.
+  local tok
+  tok="$(_primary_field "$1" 15)"
+  [[ -z "$tok" || "$tok" == "+" ]]
+}
+
+_key_trust() {
+  printf '%s:6:\n' "$1" | gpg --import-ownertrust 2>/dev/null
+}
+
+_pick_key() {
+  # _pick_key <var>: one of the keyring's secret keys; with -y, $gpg_fpr or
+  # the only key there is.
+  local _pk_var="$1"
+  local -a lines
+  mapfile -t lines < <(_secret_keys)
+  [[ ${#lines[@]} -gt 0 ]] || _die "no secret keys in $ANKH_GNUPGHOME"
+  local chosen=""
+  if [[ -n "${gpg_fpr:-}" ]]; then
+    chosen="$gpg_fpr"
+  elif [[ ${#lines[@]} -eq 1 ]]; then
+    chosen="${lines[0]%%$'\t'*}"
+  elif [[ $ANKH_YES -eq 1 ]]; then
+    _die "several secret keys: set \$gpg_fpr to choose one"
+  else
+    local i
+    for ((i = 0; i < ${#lines[@]}; i++)); do
+      printf '  %d) %s  %s\n' "$((i + 1))" "${lines[$i]%%$'\t'*}" "${lines[$i]#*$'\t'}" >&2
+    done
+    local choice
+    IFS= read -rp "Key [1-${#lines[@]}]: " choice </dev/tty
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > ${#lines[@]})); then
+      _die "no such key"
+    fi
+    chosen="${lines[$((choice - 1))]%%$'\t'*}"
+  fi
+  gpg --list-secret-keys "$chosen" >/dev/null 2>&1 || _die "no secret key $chosen"
+  # Normalise to the full fingerprint.
+  chosen="$(gpg --with-colons --fixed-list-mode --list-secret-keys "$chosen" | awk -F: '/^fpr/{print $10; exit}')"
+  printf -v "$_pk_var" '%s' "$chosen"
+}
+
+_key_generate() {
+  # Sets KEY_FPR to the new key's fingerprint. gpg-agent's pinentry asks for the
+  # passphrase: ankh never sees it.
+  # Answers with -y come from the environment (see usage).
+  local gpg_name="${gpg_name:-}" gpg_email="${gpg_email:-}"
+  local gpg_expire="${gpg_expire:-}" gpg_subkey_expire="${gpg_subkey_expire:-}"
+  local gecos
+  gecos="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f5 | cut -d, -f1)" || gecos=""
+  prompt gpg_name "Name" "$gecos"
+  prompt gpg_email "Email" ""
+  prompt gpg_expire "Primary key expiry (0 = never, e.g. 5y)" "5y"
+  prompt gpg_subkey_expire "Subkey expiry (0 = never, e.g. 2y)" "2y"
+  local uid="$gpg_name <$gpg_email>"
+  if gpg --list-secret-keys "=$uid" >/dev/null 2>&1; then
+    _die "a secret key for $uid exists already"
+  fi
+  _say "generating: an ed25519 primary key that only certifies; gpg-agent asks for its passphrase"
+  gpg --batch --quiet --quick-generate-key "$uid" ed25519 cert "$gpg_expire"
+  local fpr
+  fpr="$(gpg --with-colons --fixed-list-mode --list-secret-keys "=$uid" 2>/dev/null | awk -F: '/^fpr/{print $10; exit}')"
+  [[ -n "$fpr" ]] || _die "key generation failed"
+  KEY_FPR="$fpr"
+  _say "adding subkeys: ed25519 sign, ed25519 auth, cv25519 encrypt"
+  local use
+  for use in sign auth; do
+    gpg --batch --quiet --quick-add-key "$fpr" ed25519 "$use" "$gpg_subkey_expire"
+  done
+  gpg --batch --quiet --quick-add-key "$fpr" cv25519 encr "$gpg_subkey_expire"
+}
+
+_unpack_backup() {
+  # _unpack_backup <archive> <var>: decrypts an encrypted backup into a
+  # private scratch directory and names it.
+  local _ub_archive="$1" _ub_var="$2" _ub_tmp
+  _tmpdir _ub_tmp
+  _say "decrypting $_ub_archive (its own passphrase)"
+  gpg --quiet --no-symkey-cache --decrypt "$_ub_archive" | tar -x -C "$_ub_tmp" ||
+    _die "could not decrypt $_ub_archive"
+  printf -v "$_ub_var" '%s' "$_ub_tmp"
+}
+
+_key_import() {
+  # _key_import <file|dir|->: sets KEY_FPR to the imported key's fingerprint.
+  local src="$1" file=""
+  if [[ "$src" == "-" ]]; then
+    local t
+    _tmpdir t
+    file="$t/pasted.asc"
+    _say "paste the armored key, then Ctrl+D:"
+    cat </dev/tty >"$file"
+  elif [[ -d "$src" ]]; then
+    if [[ -f "$src/ankh-backup.tar.gpg" ]]; then
+      _unpack_backup "$src/ankh-backup.tar.gpg" src
+    fi
+    local have_full=0 have_sub=0
+    [[ -f "$src/secret.asc" ]] && have_full=1
+    [[ -f "$src/subkeys.asc" ]] && have_sub=1
+    [[ $have_full -eq 1 || $have_sub -eq 1 ]] || _die "$src holds no secret.asc or subkeys.asc"
+    local what="${key_import:-}"
+    if [[ -z "$what" ]]; then
+      if [[ $have_full -eq 1 && $have_sub -eq 1 ]]; then
+        if [[ $ANKH_YES -eq 1 ]]; then
+          what=subkeys
+        else
+          local ans
+          IFS= read -rp "Import [s]ubkeys only (a daily machine) or the [f]ull key with its primary? [s] " ans </dev/tty
+          case "${ans:-s}" in
+          s | subkeys) what=subkeys ;;
+          f | full) what=full ;;
+          *) _die "invalid choice" ;;
+          esac
+        fi
+      elif [[ $have_sub -eq 1 ]]; then
+        what=subkeys
+      else
+        what=full
+      fi
+    fi
+    case "$what" in
+    subkeys) file="$src/subkeys.asc" ;;
+    full) file="$src/secret.asc" ;;
+    *) _die "\$key_import must be subkeys or full" ;;
+    esac
+    [[ -f "$file" ]] || _die "$file is missing"
+  elif [[ -f "$src" ]]; then
+    if [[ "$src" == *.tar.gpg ]]; then
+      local u
+      _unpack_backup "$src" u
+      _key_import "$u"
+      return 0
+    fi
+    file="$src"
+  else
+    _die "$src: no such file or directory"
+  fi
+
+  # The fingerprint comes from the file itself: the keyring may hold others.
+  local -a fprs
+  mapfile -t fprs < <(gpg --with-colons --import-options show-only --import "$file" 2>/dev/null |
+    awk -F: '/^sec/{s=1; next} /^fpr/ && s{print $10; s=0}')
+  [[ ${#fprs[@]} -eq 1 ]] || _die "$file must hold exactly one secret key (found ${#fprs[@]})"
+  _say "importing ${fprs[0]}; gpg-agent may ask for its passphrase"
+  gpg --batch --quiet --import "$file" || _die "import failed"
+  KEY_FPR="${fprs[0]}"
+}
+
+cmd_key() {
+  local source="${key_source:-}" path="${key_file:-}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --generate) source=generate ;;
+    --existing) source=existing ;;
+    --import)
+      source=import
+      path="${2:-}"
+      [[ -n "$path" ]] || _die "--import needs a file, a backup directory or -"
+      shift
+      ;;
+    *) _die "key: unknown option '$1'" ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$source" ]]; then
+    if [[ $ANKH_YES -eq 1 ]]; then
+      _die "set \$key_source (existing, generate or import) with -y"
+    fi
+    local -a lines
+    mapfile -t lines < <(_secret_keys)
+    local i
+    for ((i = 0; i < ${#lines[@]}; i++)); do
+      printf '  %d) %s  %s\n' "$((i + 1))" "${lines[$i]%%$'\t'*}" "${lines[$i]#*$'\t'}" >&2
+    done
+    printf '  g) generate a new key\n  i) import from a file, a backup directory or a paste\n' >&2
+    local choice
+    IFS= read -rp "Key: " choice </dev/tty
+    case "$choice" in
+    g) source=generate ;;
+    i)
+      source=import
+      prompt path "File or backup directory (- to paste)" ""
+      ;;
+    *)
+      if ! [[ "$choice" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > ${#lines[@]})); then
+        _die "invalid choice"
+      fi
+      gpg_fpr="${lines[$((choice - 1))]%%$'\t'*}"
+      source=existing
+      ;;
+    esac
+  fi
+
+  local fpr
+  case "$source" in
+  existing) _pick_key fpr ;;
+  generate)
+    _key_generate
+    fpr="$KEY_FPR"
+    ;;
+  import)
+    [[ -n "$path" ]] || _die "set \$key_file with key_source=import"
+    _key_import "$path"
+    fpr="$KEY_FPR"
+    ;;
+  *) _die "unknown key source '$source'" ;;
+  esac
+  _key_trust "$fpr"
+  _say "using $fpr (ownertrust ultimate)"
+
+  if [[ "$source" == generate ]]; then
+    _say "back it up before anything else: ankh backup <dir>"
+    local dir=""
+    if [[ $ANKH_YES -eq 0 ]]; then
+      IFS= read -rp "Backup directory now (empty to skip): " dir </dev/tty
+    fi
+    [[ -n "$dir" ]] && gpg_fpr="$fpr" cmd_backup "$dir" --key "$fpr"
+  fi
+  printf 'key %s\n' "$fpr"
+}
+
+# --- backup ----------------------------------------------------------------
+
+_backup_ssh() {
+  # Copies every SSH key pair (a private key next to its .pub) into <dir>/ssh,
+  # keeping ~/.ssh's layout. Prints how many.
+  local dest="$1" n=0 dir pub priv rel
+  for dir in "${ANKH_SSH_DIRS[@]}"; do
+    for pub in "$dir"/*.pub; do
+      [[ -f "$pub" ]] || continue
+      priv="${pub%.pub}"
+      [[ -f "$priv" ]] || continue
+      rel="${dir#"$HOME"/.ssh}"
+      mkdir -p "$dest/ssh$rel"
+      chmod 700 "$dest/ssh" "$dest/ssh$rel"
+      cp -p "$priv" "$pub" "$dest/ssh$rel/"
+      n=$((n + 1))
+    done
+  done
+  printf '%s' "$n"
+}
+
+_backup_readme() {
+  local dir="$1" fpr="$2" uid="$3" full="$4" when
+  printf -v when '%(%F)T' -1
+  {
+    echo "ankh backup of $uid"
+    echo "fingerprint: $fpr"
+    echo "written: $when by ankh $ANKH_VERSION"
+    echo ""
+    echo "Keep this offline: a USB stick in a drawer, not a synced folder."
+    echo ""
+    echo "Files:"
+    [[ "$full" -eq 1 ]] && echo "  secret.asc      the full secret key: primary and all subkeys"
+    echo "  subkeys.asc     the subkeys only, for daily machines"
+    echo "  public.asc      the public key"
+    [[ -f "$dir/revocation.asc" ]] && echo "  revocation.asc  the revocation certificate"
+    echo "  ownertrust.txt  trust settings"
+    [[ -f "$dir/paperkey.txt" ]] && echo "  paperkey.txt    the secret part of the key, for printing"
+    [[ -d "$dir/ssh" ]] && echo "  ssh/            SSH key pairs, laid out as in ~/.ssh"
+    echo ""
+    echo "Restore:"
+    echo "  ankh key --import <this directory>"
+    echo "or by hand:"
+    echo "  gpg --import subkeys.asc       (or secret.asc for the full key)"
+    echo "  gpg --import-ownertrust ownertrust.txt"
+    echo ""
+    echo "The secret keys are protected by the key's passphrase."
+  } >"$dir/README.txt"
+}
+
+_backup_verify() {
+  # _backup_verify <file> <fpr> <full>: imports into a throwaway home, then
+  # signs and decrypts a test message. Keys held on a card can't be tested.
+  local file="$1" fpr="$2" full="$3" h
+  _temp_gnupghome h
+  local g=(env GNUPGHOME="$h" gpg --batch --quiet)
+  "${g[@]}" --import "$file" 2>/dev/null || return 1
+  "${g[@]}" --list-secret-keys "$fpr" >/dev/null 2>&1 || return 1
+  local tok
+  tok="$(GNUPGHOME="$h" gpg --with-colons --fixed-list-mode --list-secret-keys "$fpr" | awk -F: '/^sec/{print $15; exit}')"
+  if [[ "$full" -eq 1 ]]; then
+    [[ -z "$tok" || "$tok" == "+" ]] || return 1
+  else
+    [[ "$tok" == "#" ]] || return 1
+  fi
+  local msg="ankh backup check" out
+  out="$(printf '%s' "$msg" | "${g[@]}" --local-user "$fpr" --sign 2>/dev/null |
+    "${g[@]}" --decrypt 2>/dev/null)" || return 1
+  [[ "$out" == "$msg" ]] || return 1
+  out="$(printf '%s' "$msg" | "${g[@]}" --trust-model always --recipient "$fpr" --encrypt 2>/dev/null |
+    "${g[@]}" --decrypt 2>/dev/null)" || return 1
+  [[ "$out" == "$msg" ]]
+}
+
+cmd_backup() {
+  local dir="" encrypt=0 remove=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --key)
+      gpg_fpr="${2:-}"
+      [[ -n "$gpg_fpr" ]] || _die "--key needs a fingerprint"
+      shift
+      ;;
+    --encrypt) encrypt=1 ;;
+    --remove-primary) remove=1 ;;
+    -*) _die "backup: unknown option '$1'" ;;
+    *)
+      [[ -z "$dir" ]] || _die "backup: one directory only"
+      dir="$1"
+      ;;
+    esac
+    shift
+  done
+  [[ -n "$dir" ]] || _die "usage: ankh backup <dir> [--key <fpr>] [--encrypt] [--remove-primary]"
+
+  local fpr
+  _pick_key fpr
+  local uid
+  uid="$(_secret_keys | awk -F'\t' -v f="$fpr" '$1==f{print $2; exit}')"
+
+  if [[ -e "$dir" ]]; then
+    [[ -d "$dir" ]] || _die "$dir exists and is not a directory"
+    [[ -z "$(ls -A "$dir")" ]] || _die "$dir is not empty"
+  fi
+  local parent
+  parent="$(dirname "$dir")"
+  [[ -d "$parent" ]] || _die "$parent does not exist"
+  if git -C "$parent" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    _die "$dir is inside a git work tree: a backup must not be synced anywhere"
+  fi
+
+  # With --encrypt, nothing readable may reach the target: flash and SSDs
+  # remap writes, so files deleted there can still be recovered. The backup
+  # is built and checked in a private scratch directory, in memory where
+  # possible, and only the sealed archive is written to the target.
+  local work
+  if [[ $encrypt -eq 1 ]]; then
+    _tmpdir work
+    local fs
+    fs="$(stat -f -c %T "$work" 2>/dev/null || true)"
+    if [[ "$fs" != tmpfs && "$fs" != ramfs ]]; then
+      _say "warning: no tmpfs found; the unencrypted backup is staged on disk in $work while it's built"
+    fi
+    work="$work/backup"
+    mkdir "$work"
+  else
+    mkdir -p "$dir"
+    work="$dir"
+  fi
+  chmod 700 "$work"
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+
+  local full=0
+  if _primary_here "$fpr"; then
+    full=1
+  else
+    _say "the primary key isn't on this machine: the backup holds the subkeys only"
+  fi
+
+  _say "exporting $fpr; gpg-agent may ask for the passphrase"
+  gpg --armor --export "$fpr" >"$work/public.asc"
+  if [[ $full -eq 1 ]]; then
+    gpg --armor --export-secret-keys "$fpr" >"$work/secret.asc" || _die "export failed"
+  fi
+  gpg --armor --export-secret-subkeys "$fpr" >"$work/subkeys.asc" || _die "export failed"
+  gpg --export-ownertrust 2>/dev/null | grep "^$fpr:" >"$work/ownertrust.txt" || printf '%s:6:\n' "$fpr" >"$work/ownertrust.txt"
+  if [[ -f "$ANKH_GNUPGHOME/openpgp-revocs.d/$fpr.rev" ]]; then
+    cp "$ANKH_GNUPGHOME/openpgp-revocs.d/$fpr.rev" "$work/revocation.asc"
+  else
+    _say "warning: no revocation certificate in $ANKH_GNUPGHOME/openpgp-revocs.d"
+  fi
+  if [[ $full -eq 1 ]] && command -v paperkey >/dev/null 2>&1; then
+    gpg --export-secret-keys "$fpr" | paperkey --output "$work/paperkey.txt"
+  fi
+  local n_ssh
+  n_ssh="$(_backup_ssh "$work")"
+  _backup_readme "$work" "$fpr" "$uid" "$full"
+
+  _say "verifying: importing into a throwaway gpg home, then signing and decrypting"
+  local verified=1
+  if [[ $full -eq 1 ]]; then
+    if _backup_verify "$work/secret.asc" "$fpr" 1; then
+      _say "ok: secret.asc restores the full key, and it signs and decrypts"
+    else
+      _say "FAILED: secret.asc did not restore a working key"
+      verified=0
+    fi
+  fi
+  if _backup_verify "$work/subkeys.asc" "$fpr" 0; then
+    _say "ok: subkeys.asc restores the subkeys, and they sign and decrypt"
+  else
+    _say "FAILED: subkeys.asc did not restore working subkeys (keys on a card can't be tested here)"
+    verified=0
+  fi
+  if [[ $verified -ne 1 ]]; then
+    [[ $encrypt -eq 1 ]] && _die "the backup is NOT good; nothing was written to $dir"
+    _die "the backup in $dir is NOT good"
+  fi
+  _say "$n_ssh SSH key pair(s) copied"
+
+  if [[ $encrypt -eq 1 ]]; then
+    _say "sealing the backup with its own passphrase (asked twice, not cached)"
+    local sealed="${work%/backup}/ankh-backup.tar.gpg"
+    tar -C "$work" -cf - . | gpg --quiet --no-symkey-cache --symmetric --output "$sealed" ||
+      _die "sealing failed; nothing was written to $dir"
+    _say "checking the archive opens (the passphrase once more)"
+    gpg --quiet --no-symkey-cache --decrypt "$sealed" 2>/dev/null | tar -t >/dev/null ||
+      _die "the archive didn't open; nothing was written to $dir"
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    cp "$sealed" "$dir/ankh-backup.tar.gpg"
+    {
+      echo "ankh backup of $uid, encrypted"
+      echo "fingerprint: $fpr"
+      echo ""
+      echo "ankh-backup.tar.gpg holds the backup; open it with its own passphrase:"
+      echo "  ankh key --import <this directory>"
+      echo "or by hand:"
+      echo "  gpg --decrypt ankh-backup.tar.gpg | tar -x"
+    } >"$dir/README.txt"
+  fi
+  umask "$old_umask"
+  dir="$(cd "$dir" && pwd)"
+  _say "backup written to $dir: keep it offline"
+
+
+  if [[ $full -eq 1 ]]; then
+    if [[ $remove -eq 1 ]] || _confirm "Remove the primary key from this machine? It stays in the backup."; then
+      local grip
+      grip="$(_primary_grip "$fpr")"
+      gpg-connect-agent "DELETE_KEY --force $grip" /bye >/dev/null 2>&1 || true
+      if _primary_here "$fpr"; then
+        _die "the primary key could not be removed"
+      fi
+      _say "the primary key is gone from this machine; the subkeys stay"
+    fi
+  fi
+  printf 'backup %s\n' "$dir"
+}
+
 main() {
+  while [[ "${1:-}" == -y || "${1:-}" == --yes ]]; do
+    ANKH_YES=1
+    shift
+  done
   case "${1:-}" in
   check)
     shift
     cmd_check "$@"
+    ;;
+  key)
+    shift
+    cmd_key "$@"
+    ;;
+  backup)
+    shift
+    cmd_backup "$@"
     ;;
   version | --version)
     printf 'ankh %s\n' "$ANKH_VERSION"
