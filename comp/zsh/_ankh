@@ -1,0 +1,19 @@
+#compdef ankh
+
+_ankh() {
+  local -a commands
+  commands=(
+    'check:report on tools, gpg-agent, keys, the pass store and SSH'
+    'version:print the version'
+    'help:show the help'
+  )
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+    return
+  fi
+  case "$words[2]" in
+  check) _arguments '--decrypt[also decrypt one entry; the value is discarded]' ;;
+  esac
+}
+
+_ankh "$@"
