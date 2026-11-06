@@ -28,7 +28,20 @@ make install                # into ~/.local/bin
 make install-completions    # bash, zsh and fish
 ```
 
-From 0.1.0, each release also publishes the script with a SHA-256 checksum and a gpg signature. Keep the checksum, or the signing key's fingerprint, somewhere you trust (your offline backup is a good place), and check against it before running a downloaded copy. Checking a signature only needs the public key, so it works on a machine that has none of your secrets yet.
+Each release publishes `ankh`, `ankh-verify`, their checksums (`SHA256SUMS`) and a gpg signature over the checksums (`SHA256SUMS.asc`). `ankh-verify` compares a copy against the checksums on every mirror; the signature also covers a release tampered with at its origin, which the mirrors would copy faithfully:
+
+```sh
+gpg --verify SHA256SUMS.asc SHA256SUMS   # signed by the key below
+sha256sum -c SHA256SUMS
+```
+
+The releases are signed by:
+
+```
+BF98 6D66 57FB 89DA 22D5  4E28 93FA 6B48 46DA AF92
+```
+
+Keep this fingerprint, or the checksums, somewhere you trust (your offline backup is a good place). Checking a signature needs only the public key, so it works on a machine that has none of your secrets yet.
 
 With Nix: `nix run 'git+https://codeberg.org/lede/ankh?ref=<release tag>'`, or `homeManagerModules.default` from the flake.
 

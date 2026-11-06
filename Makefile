@@ -6,7 +6,9 @@ ZSH_COMP_DIR  ?= $(HOME)/.local/share/zsh/site-functions
 BASH_COMP_DIR ?= $(HOME)/.local/share/bash-completion/completions
 FISH_COMP_DIR ?= $(HOME)/.config/fish/completions
 
-.PHONY: install install-completions lint test
+SIGNER        ?= BF986D6657FB89DA22D54E2893FA6B4846DAAF92
+
+.PHONY: install install-completions lint test dist sign
 
 install:
 	@mkdir -p "$(BINDIR)"
@@ -33,3 +35,15 @@ lint:
 
 test:
 	bash tests/run.sh
+
+# A release's files: the two scripts and their checksums, then a detached
+# signature over the checksums (gpg-agent asks for the passphrase).
+dist:
+	@rm -rf dist && mkdir dist
+	@cp ankh ankh-verify dist/
+	@cd dist && sha256sum ankh ankh-verify >SHA256SUMS
+	@cat dist/SHA256SUMS
+
+sign: dist
+	gpg --local-user "$(SIGNER)!" --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+	gpg --verify dist/SHA256SUMS.asc dist/SHA256SUMS
