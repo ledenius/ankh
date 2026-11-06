@@ -26,7 +26,7 @@ file="${file:-$(dirname "$0")/ankh}" && name="${name:-$(basename "$file")}"
 tag="v$(sed -n 's/^ANKH_VERSION="\([0-9A-Za-z.+-]*\)"$/\1/p' "$file" | head -n 1)"
 if [[ $defaults -eq 1 && "$tag" != v ]]; then
   cps+=("https://codeberg.org/lede/ankh/releases/download/$tag/SHA256SUMS"
-    "https://github.com/lede/ankh/releases/download/$tag/SHA256SUMS"
+    "https://github.com/ledenius/ankh/releases/download/$tag/SHA256SUMS"
     "https://gitlab.com/lede/ankh/-/releases/$tag/downloads/SHA256SUMS")
 fi
 fetch() {
