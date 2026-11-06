@@ -1803,7 +1803,7 @@ _default_checkpoints() {
   local tag="$1"
   printf '%s\n' \
     "https://codeberg.org/lede/ankh/releases/download/$tag/SHA256SUMS" \
-    "https://github.com/lede/ankh/releases/download/$tag/SHA256SUMS" \
+    "https://github.com/ledenius/ankh/releases/download/$tag/SHA256SUMS" \
     "https://gitlab.com/lede/ankh/-/releases/$tag/downloads/SHA256SUMS"
 }
 
