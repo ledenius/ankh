@@ -13,7 +13,7 @@
       # so `nix run` has everything. pinentry is gpg-agent's to choose.
       mkAnkh = pkgs: pkgs.stdenv.mkDerivation {
         pname = "ankh";
-        version = "0.1.0-dev";
+        version = "0.1.0";
         src = self;
         nativeBuildInputs = [ pkgs.makeWrapper ];
         dontBuild = true;

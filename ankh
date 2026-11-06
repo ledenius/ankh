@@ -19,7 +19,7 @@ if [[ "${BASH_VERSINFO[0]}" -lt 5 ]]; then
 fi
 set -euo pipefail
 
-ANKH_VERSION="0.1.0-dev"
+ANKH_VERSION="0.1.0"
 
 # Drop ankh's own directory from PATH so the commands it runs (gpg, pass, ...)
 # never resolve to sibling files installed next to the script itself.
