@@ -32,7 +32,7 @@ Each release publishes `ankh`, `ankh-verify` and their checksums (`SHA256SUMS`).
 
 Releases aren't signed yet. The mirrors copy one origin, so until they are, the checksums catch a tampered download host but not a release tampered with at its origin. A gpg signature over `SHA256SUMS`, and the fingerprint to check it against, come in a later release.
 
-With Nix: `nix run 'git+https://codeberg.org/lede/ankh?ref=<release tag>'`, or `homeManagerModules.default` from the flake.
+With Nix: `nix run --no-write-lock-file 'git+https://codeberg.org/lede/ankh?ref=refs/tags/<release tag>'` (the flake ships without a lock file, so it builds against your nixpkgs), or `homeManagerModules.default` from the flake.
 
 ## Requirements
 
