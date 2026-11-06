@@ -1709,7 +1709,7 @@ _send_paste() {
   pw="$(_one_time_passphrase)"
   tar -C "$t/bundle" -czf - . |
     gpg --batch --quiet --no-symkey-cache --pinentry-mode loopback --passphrase-fd 3 \
-      --armor --symmetric --output "$t/bundle.asc" 3<<<"$pw" || _die "sealing failed"
+      --armor --symmetric --output "$t/bundle.asc" 3< <(printf '%s\n' "$pw") || _die "sealing failed"
   cat "$t/bundle.asc"
   if [[ $MOVE_QR -eq 1 ]]; then
     command -v qrencode >/dev/null 2>&1 || _die "--qr needs qrencode"
