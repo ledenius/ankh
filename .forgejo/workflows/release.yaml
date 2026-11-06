@@ -1,0 +1,74 @@
+# A tag v* publishes the release on the public mirrors. The push mirrors
+# carry the tag; this creates each host's release with ankh, ankh-verify and
+# SHA256SUMS, then checks every host confirms them (ci/release.sh).
+# Secrets: CODEBERG_RELEASE_TOKEN (Codeberg, write:repository) and
+# GH_RELEASE_TOKEN (GitHub, fine-grained: ledenius/ankh, Contents read and
+# write). A host whose secret is missing is skipped with a warning.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  provision:
+    runs-on: [cryptrunner]
+    outputs:
+      label: ${{ steps.provision.outputs.runner-label }}
+    steps:
+      - name: Bootstrap checkout
+        shell: bash
+        run: |
+          git clone -q --depth 1 --branch v0 \
+            "https://${{ secrets.CI_TEMPLATES_TOKEN }}@git.krypta.fi/ci-templates/checkout.git" \
+            .ci-checkout
+      - uses: ./.ci-checkout
+        with:
+          repository: ci-templates/provision-runner
+          token: ${{ secrets.CI_TEMPLATES_TOKEN }}
+          ref: v0
+          path: .ci-provision-runner
+      - id: provision
+        uses: ./.ci-provision-runner
+        with:
+          image: git.krypta.fi/ocimg/ci-run-scripts:0.0.1
+          label: ankh-release-${{ github.run_id }}
+
+  publish:
+    needs: provision
+    runs-on: ${{ needs.provision.outputs.label }}
+    steps:
+      - name: Bootstrap checkout
+        shell: bash
+        run: |
+          git clone -q --depth 1 --branch v0 \
+            "https://${{ secrets.CI_TEMPLATES_TOKEN }}@git.krypta.fi/ci-templates/checkout.git" \
+            .ci-checkout
+      - uses: ./.ci-checkout
+        with:
+          path: ankh
+      - name: Publish on the mirrors
+        shell: bash
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+        run: bash ankh/ci/release.sh "${{ github.ref_name }}"
+
+  deprovision:
+    needs: [provision, publish]
+    if: always()
+    runs-on: [cryptrunner]
+    steps:
+      - name: Bootstrap checkout
+        shell: bash
+        run: |
+          git clone -q --depth 1 --branch v0 \
+            "https://${{ secrets.CI_TEMPLATES_TOKEN }}@git.krypta.fi/ci-templates/checkout.git" \
+            .ci-checkout
+      - uses: ./.ci-checkout
+        with:
+          repository: ci-templates/deprovision-runner
+          token: ${{ secrets.CI_TEMPLATES_TOKEN }}
+          ref: v0
+          path: .ci-deprovision-runner
+      - uses: ./.ci-deprovision-runner
+        with:
+          label: ankh-release-${{ github.run_id }}
