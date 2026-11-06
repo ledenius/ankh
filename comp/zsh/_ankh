@@ -3,9 +3,12 @@
 _ankh() {
   local -a commands
   commands=(
+    'init:check, then key, pass and ssh, then check again'
     'check:report on tools, gpg-agent, keys, the pass store and SSH'
     'key:choose, generate or import the gpg key'
     'backup:write a complete, verified backup to keep offline'
+    'pass:check, clone or start the pass store'
+    'ssh:generate or place an SSH key, or use gpg-agent'
     'version:print the version'
     'help:show the help'
   )
@@ -23,6 +26,21 @@ _ankh() {
         '(--generate --import)--existing[a key already in the keyring]' \
         '(--existing --import)--generate[a new key]' \
         '(--existing --generate)--import[a file, a backup directory or - to paste]:source:_files'
+      ;;
+    pass)
+      _arguments \
+        '(--new)--clone[clone the store]:git URL:' \
+        '(--clone)--new[a new store encrypted to the key]' \
+        '--remote[git remote for the new store]:git URL:' \
+        '--key[the key]:fingerprint:'
+      ;;
+    ssh)
+      _arguments \
+        '(--existing --gpg --fido2)--generate[a new ed25519 key]' \
+        '(--generate --gpg --fido2)--existing[an existing private key file]:key file:_files' \
+        '(--generate --existing --fido2)--gpg[the authentication subkey of the gpg key, through gpg-agent]' \
+        '(--generate --existing --gpg)--fido2[an ed25519-sk key on a security key]' \
+        '--no-passphrase[no passphrase on a generated key]'
       ;;
     backup)
       _arguments \
