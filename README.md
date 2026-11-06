@@ -182,6 +182,8 @@ make lint   # shellcheck, bash -n, completions
 make test   # every command against a throwaway HOME, GNUPGHOME and store
 ```
 
+A release is a tag: bump `ANKH_VERSION`, merge, then push `v<version>`. The push mirrors carry the tag, and `.forgejo/workflows/release.yaml` runs `ci/release.sh`, which creates the release on each mirror with `ankh`, `ankh-verify` and `SHA256SUMS`, then checks that every mirror confirms them.
+
 ## License
 
 [GNU General Public License v3.0 or later](LICENSE)
