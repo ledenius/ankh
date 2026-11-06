@@ -12,8 +12,7 @@ ankh is published on [Codeberg](https://codeberg.org/lede/ankh). Any copy can se
 
 ## Status
 
-Early. Today ankh has `check`, `key` and `backup`. The rest is planned, in this order:
-- `pass`, `ssh` and `init`;
+Early. Today ankh has `init`, `check`, `key`, `backup`, `pass` and `ssh`. Still planned, in this order:
 - moving everything between machines (`pull`, `send`, paste);
 - smartcards (`card`).
 
@@ -40,6 +39,46 @@ With Nix: `nix run 'git+https://codeberg.org/lede/ankh?ref=<release tag>'`, or `
 |---|---|
 | Required | bash 5+, gpg (with gpg-agent and a pinentry), git, pass, OpenSSH (ssh, ssh-keygen, ssh-add, scp) |
 | Optional | rsync (used to copy between machines; scp otherwise), paperkey (printable backups), ykman (YubiKey touch policy), qrencode (QR codes for pasted bundles) |
+
+## init
+
+```sh
+ankh init
+```
+
+The whole bootstrap, in order: `check`, then `key`, `pass` and `ssh`, then `check` again. Each step asks what it needs.
+
+## pass
+
+```sh
+ankh pass                         # check the store here, or ask how to get one
+ankh pass --clone <git url>       # clone your existing store
+ankh pass --new [--remote <url>]  # a new store, encrypted to the key
+```
+
+- A store that's already here is accepted only if it's encrypted to a key this machine has.
+- A store encrypted to another key is refused, with the `pass init` that would re-encrypt it.
+- After a clone, one entry is decrypted to prove the key works; the value is discarded.
+- **Git identity:** pass commits every change. If git doesn't know who you are yet (common on a fresh machine), the store gets a local identity from the gpg key's user ID.
+
+## ssh
+
+```sh
+ankh ssh                           # choose interactively
+ankh ssh --generate                # a new ed25519 key
+ankh ssh --existing <private key>  # place a key from a backup or a stick
+ankh ssh --gpg                     # the gpg key's authentication subkey, through gpg-agent
+ankh ssh --fido2                   # an ed25519-sk key on a security key (untested yet)
+```
+
+- **Placing a key:** ankh asks each key's name and directory. The defaults are its own name (`id_ed25519` for a new key) and `~/.ssh`. An existing file is never overwritten.
+- **Passphrases** are asked by `ssh-keygen`. `--no-passphrase` skips it, with a warning.
+- **Backups:** key files are backed up into pass as `ssh/<name>/key`, once there's a store.
+- **The public key** is printed at the end, ready for `authorized_keys` and your git hosts.
+- **`--gpg`:**
+  - turns on `enable-ssh-support` in `gpg-agent.conf`, after asking;
+  - adds the chosen authentication subkey's keygrip to `sshcontrol`;
+  - prints the `SSH_AUTH_SOCK` line for your shell config. Your shell config is never edited.
 
 ## check
 
@@ -71,7 +110,7 @@ ankh key --import <file|dir|-> # an armored file, a backup directory, or a paste
 - **Generated keys:** an ed25519 primary key that only certifies (default expiry 5y), and ed25519 signing, ed25519 authentication and cv25519 encryption subkeys (default 2y). gpg-agent's pinentry asks for the passphrase: ankh never sees it. You're offered a backup straight away.
 - **From a backup directory:** the subkeys only by default, which is what a daily machine needs. The full key, with its primary, is offered too. Encrypted backups are opened first.
 - In every case the key gets ultimate ownertrust.
-- `ankh -y key` runs without questions, taking its answers from the environment: `key_source` (`existing`, `generate`, `import`), `key_file`, `key_import` (`subkeys`, `full`), `gpg_fpr`, `gpg_name`, `gpg_email`, `gpg_expire`, `gpg_subkey_expire`. Passphrases are still asked by gpg-agent.
+- `ankh -y key` runs without questions, taking its answers from the environment: `key_source` (`existing`, `generate`, `import`), `key_file`, `key_import` (`subkeys`, `full`), `gpg_fpr`, `gpg_name`, `gpg_email`, `gpg_expire`, `gpg_subkey_expire`; for the other steps, `pass_source` (`clone`, `new`), `pass_remote`, `ssh_source` (`generate`, `existing`, `gpg`, `fido2`), `ssh_file`, `ssh_name`, `ssh_dir`, `ssh_subkey`, `ssh_no_passphrase`. Passphrases are still asked by gpg-agent and ssh-keygen.
 
 ## backup
 

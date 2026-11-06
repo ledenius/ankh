@@ -67,13 +67,26 @@ Commands:
                          Verified by restoring it into a throwaway gpg home.
                          --encrypt seals it with its own passphrase;
                          --remove-primary then leaves only the subkeys here
+  pass [--clone <url> | --new [--remote <url>]] [--key <fpr>]
+                         Get the pass store: check the one here, clone it,
+                         or start a new one encrypted to the key. Proves the
+                         key decrypts it (the value is discarded)
+  ssh [--generate | --existing <file> | --gpg | --fido2] [--no-passphrase]
+                         Get an SSH key: generate one, place an existing
+                         one, use the gpg key's authentication subkey through
+                         gpg-agent, or a FIDO2 key. Asks each key's name and
+                         directory (defaults: its own name, ~/.ssh); backs
+                         file keys up into pass as ssh/<name>/key
+  init                   check, then key, pass and ssh, then check again
   version                Print ankh's version
   help                   Show this help
 
 Options:
   -y, --yes              Non-interactive: answers come from the environment
                          (key_source, key_file, key_import, gpg_fpr, gpg_name,
-                         gpg_email, gpg_expire, gpg_subkey_expire).
+                         gpg_email, gpg_expire, gpg_subkey_expire,
+                         pass_source, pass_remote, ssh_source, ssh_file,
+                         ssh_name, ssh_dir, ssh_subkey, ssh_no_passphrase).
                          Passphrases are always asked by gpg-agent
 
 Environment:
@@ -504,6 +517,11 @@ cmd_check() {
     esac
     shift
   done
+  # init runs check twice: start each from nothing.
+  CHECK_FAILS=0
+  CHECK_WARNS=0
+  KEY_ENC_IDS=()
+  KEY_AUTH_GRIPS=()
   _check_tools
   _check_agent
   _check_keys
@@ -517,6 +535,7 @@ cmd_check() {
 
 ANKH_YES=0
 KEY_FPR=""
+SSH_PATH=""
 declare -a ANKH_TMP=()
 
 _cleanup() {
@@ -833,6 +852,7 @@ cmd_key() {
     fi
     [[ -n "$dir" ]] && gpg_fpr="$fpr" cmd_backup "$dir" --key "$fpr"
   fi
+  KEY_FPR="$fpr"
   printf 'key %s\n' "$fpr"
 }
 
@@ -1058,6 +1078,348 @@ cmd_backup() {
   printf 'backup %s\n' "$dir"
 }
 
+_tty() {
+  # Runs a command that may prompt, on the terminal unless -y.
+  if [[ $ANKH_YES -eq 1 ]]; then "$@" </dev/null; else "$@" </dev/tty; fi
+}
+
+_confirm_yes() {
+  # _confirm_yes <question>: yes unless declined; with -y, always yes.
+  [[ $ANKH_YES -eq 1 ]] && return 0
+  local ans
+  IFS= read -rp "$1 [Y/n] " ans </dev/tty
+  [[ -z "$ans" || "$ans" == y || "$ans" == Y || "$ans" == yes ]]
+}
+
+# --- pass ------------------------------------------------------------------
+
+_enc_ids() {
+  # The long IDs of this machine's usable encryption subkeys (not stubs).
+  gpg --with-colons --fixed-list-mode --list-secret-keys 2>/dev/null |
+    awk -F: '/^ssb/ && $12 ~ /e/ && $15 != "#" && $2 != "r" && $2 != "e" {print toupper($5)}'
+}
+
+_store_recipients_ok() {
+  # True when a sample entry is encrypted to a subkey this machine has, or
+  # when the store has no entries yet. Reads headers only, decrypts nothing.
+  local sample
+  sample="$(find "$ANKH_STORE" -path "$ANKH_STORE/.git" -prune -o -type f -name '*.gpg' -print -quit)"
+  [[ -n "$sample" ]] || return 0
+  local -a to mine
+  mapfile -t to < <(gpg --batch --list-only --status-fd 1 --decrypt "$sample" 2>/dev/null |
+    awk '$1=="[GNUPG:]" && $2=="ENC_TO"{print toupper($3)}')
+  mapfile -t mine < <(_enc_ids)
+  local a b
+  for a in "${to[@]}"; do
+    for b in "${mine[@]}"; do
+      [[ "$a" == "$b" ]] && return 0
+    done
+  done
+  return 1
+}
+
+_store_git_identity() {
+  # pass commits every change; on a fresh machine git may not know who you
+  # are yet. Then the store gets a local identity from the key's user ID.
+  local fpr="$1"
+  git -C "$ANKH_STORE" config user.email >/dev/null 2>&1 && return 0
+  local uid name email
+  uid="$(_secret_keys | awk -F'\t' -v f="$fpr" '$1==f{print $2; exit}')"
+  name="${uid%% <*}"
+  email="${uid##*<}"
+  email="${email%>}"
+  [[ -n "$email" && "$email" != "$uid" ]] || return 0
+  git -C "$ANKH_STORE" config user.name "$name"
+  git -C "$ANKH_STORE" config user.email "$email"
+  _say "git has no identity here: the store commits as $name <$email>"
+}
+
+_pass_test_decrypt() {
+  # Decrypts one entry to nowhere: proves the key works, shows nothing.
+  local sample
+  sample="$(find "$ANKH_STORE" -path "$ANKH_STORE/.git" -prune -o -type f -name '*.gpg' -print -quit)"
+  [[ -n "$sample" ]] || return 0
+  _say "test decrypt of one entry (gpg-agent may ask for the passphrase); the value is discarded"
+  gpg --quiet --batch --decrypt "$sample" >/dev/null 2>&1
+}
+
+cmd_pass() {
+  local source="${pass_source:-}" remote="${pass_remote:-}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --clone)
+      source=clone
+      remote="${2:-}"
+      [[ -n "$remote" ]] || _die "--clone needs the store's git URL"
+      shift
+      ;;
+    --new) source=new ;;
+    --remote)
+      remote="${2:-}"
+      [[ -n "$remote" ]] || _die "--remote needs a git URL"
+      shift
+      ;;
+    --key)
+      gpg_fpr="${2:-}"
+      shift
+      ;;
+    *) _die "pass: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  local fpr
+  _pick_key fpr
+
+  if [[ -f "$ANKH_STORE/.gpg-id" ]]; then
+    if _store_recipients_ok; then
+      _say "the store at $ANKH_STORE is already here, encrypted to this key"
+      _pass_test_decrypt || _die "the test decrypt failed"
+      printf 'pass %s\n' "$ANKH_STORE"
+      return 0
+    fi
+    _die "the store at $ANKH_STORE is encrypted to another key; re-encrypt it there with: pass init $fpr"
+  fi
+  if [[ -e "$ANKH_STORE" && -n "$(ls -A "$ANKH_STORE" 2>/dev/null)" ]]; then
+    _die "$ANKH_STORE exists but isn't a pass store"
+  fi
+
+  if [[ -z "$source" ]]; then
+    [[ $ANKH_YES -eq 1 ]] && _die "set \$pass_source (clone or new) with -y"
+    local ans
+    IFS= read -rp "No store at $ANKH_STORE: [c]lone one or start a [n]ew one? " ans </dev/tty
+    case "$ans" in
+    c | clone)
+      source=clone
+      prompt remote "The store's git URL" ""
+      ;;
+    n | new) source=new ;;
+    *) _die "invalid choice" ;;
+    esac
+  fi
+
+  case "$source" in
+  clone)
+    [[ -n "$remote" ]] || _die "set \$pass_remote to the store's git URL"
+    _say "cloning $remote into $ANKH_STORE"
+    git clone -q "$remote" "$ANKH_STORE" || _die "clone failed"
+    _store_git_identity "$fpr"
+    _store_recipients_ok || _die "the cloned store is encrypted to keys this machine doesn't have"
+    _pass_test_decrypt || _die "the test decrypt failed"
+    ;;
+  new)
+    PASSWORD_STORE_DIR="$ANKH_STORE" pass init "$fpr" >/dev/null
+    git -C "$ANKH_STORE" init -q
+    _store_git_identity "$fpr"
+    PASSWORD_STORE_DIR="$ANKH_STORE" pass git init >/dev/null
+    if [[ -z "$remote" && $ANKH_YES -eq 0 ]]; then
+      IFS= read -rp "Git remote for the store (empty for none): " remote </dev/tty
+    fi
+    if [[ -n "$remote" ]]; then
+      git -C "$ANKH_STORE" remote add origin "$remote"
+      _say "remote origin is $remote; push with: pass git push -u origin HEAD"
+    fi
+    _say "new store at $ANKH_STORE, encrypted to $fpr"
+    ;;
+  *) _die "unknown pass source '$source'" ;;
+  esac
+  printf 'pass %s\n' "$ANKH_STORE"
+}
+
+# --- ssh -------------------------------------------------------------------
+
+_ssh_place() {
+  # _ssh_place <default name>: asks where the key goes. Sets SSH_PATH.
+  local default_name="$1"
+  local ssh_name="${ssh_name:-}" ssh_dir="${ssh_dir:-}"
+  prompt ssh_name "Key name" "$default_name"
+  prompt ssh_dir "Directory" "$HOME/.ssh"
+  [[ "$ssh_name" != */* ]] || _die "a key name can't contain /"
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+  SSH_PATH="$ssh_dir/$ssh_name"
+  [[ ! -e "$SSH_PATH" && ! -e "$SSH_PATH.pub" ]] || _die "$SSH_PATH exists already; choose another name"
+}
+
+_ssh_to_pass() {
+  # Backs a key up into pass as ssh/<name>/key, as greb did.
+  local path="$1" name
+  name="$(basename "$path")"
+  if [[ ! -f "$ANKH_STORE/.gpg-id" ]]; then
+    _say "no pass store yet: $name isn't backed up into pass (ankh pass, then ankh ssh again)"
+    return 0
+  fi
+  _confirm_yes "Back $name up into pass as ssh/$name/key?" || return 0
+  PASSWORD_STORE_DIR="$ANKH_STORE" pass insert -m -f "ssh/$name/key" <"$path" >/dev/null ||
+    _die "writing ssh/$name/key into pass failed"
+  _say "backed up into pass: ssh/$name/key"
+}
+
+_ssh_to_agent() {
+  local path="$1"
+  [[ $ANKH_YES -eq 1 ]] && return 0
+  [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]] || return 0
+  _confirm_yes "Add it to the SSH agent now?" && ssh-add "$path"
+  return 0
+}
+
+_ssh_gpg() {
+  # SSH through gpg-agent: an authentication subkey offered via sshcontrol.
+  local fpr
+  _pick_key fpr
+  local -a subs
+  mapfile -t subs < <(gpg --with-colons --fixed-list-mode --with-keygrip --list-secret-keys "$fpr" 2>/dev/null |
+    awk -F: '/^ssb/{a = ($12 ~ /a/ && $15 != "#" && $2 != "r" && $2 != "e"); id = $5; next}
+             /^grp/ && a {print id "\t" $10; a = 0}')
+  [[ ${#subs[@]} -gt 0 ]] || _die "$fpr has no usable authentication subkey"
+  local pick="${subs[0]}"
+  if [[ ${#subs[@]} -gt 1 ]]; then
+    if [[ -n "${ssh_subkey:-}" ]]; then
+      local s
+      pick=""
+      for s in "${subs[@]}"; do
+        [[ "${s%%$'\t'*}" == "${ssh_subkey^^}" ]] && pick="$s"
+      done
+      [[ -n "$pick" ]] || _die "no authentication subkey ${ssh_subkey}"
+    elif [[ $ANKH_YES -eq 1 ]]; then
+      _die "several authentication subkeys: set \$ssh_subkey to one"
+    else
+      local i choice
+      for ((i = 0; i < ${#subs[@]}; i++)); do
+        printf '  %d) %s (keygrip %s)\n' "$((i + 1))" "${subs[$i]%%$'\t'*}" "${subs[$i]#*$'\t'}" >&2
+      done
+      IFS= read -rp "Authentication subkey [1-${#subs[@]}]: " choice </dev/tty
+      if ! [[ "$choice" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > ${#subs[@]})); then
+        _die "invalid choice"
+      fi
+      pick="${subs[$((choice - 1))]}"
+    fi
+  fi
+  local id="${pick%%$'\t'*}" grip="${pick#*$'\t'}"
+
+  local conf="$ANKH_GNUPGHOME/gpg-agent.conf" control="$ANKH_GNUPGHOME/sshcontrol"
+  if ! grep -qE '^[[:space:]]*enable-ssh-support' "$conf" 2>/dev/null; then
+    _confirm_yes "Turn on SSH support in $conf?" || _die "SSH through gpg-agent needs enable-ssh-support"
+    echo "enable-ssh-support" >>"$conf"
+    gpgconf --kill gpg-agent
+    gpg-connect-agent /bye >/dev/null 2>&1
+  fi
+  if ! grep -qE "^[[:space:]]*$grip([[:space:]]|$)" "$control" 2>/dev/null; then
+    echo "$grip" >>"$control"
+    chmod 600 "$control"
+  fi
+  _say "gpg-agent offers authentication subkey $id to SSH"
+  local sock
+  sock="$(gpgconf --list-dirs agent-ssh-socket)"
+  if [[ "${SSH_AUTH_SOCK:-}" -ef "$sock" ]]; then
+    _say "SSH_AUTH_SOCK already points to gpg-agent"
+  else
+    _say "point SSH at gpg-agent; add to your shell config:"
+    # shellcheck disable=SC2016 # printed for the user's shell, unexpanded
+    printf '  export SSH_AUTH_SOCK="$(gpgconf --list-dirs agent-ssh-socket)"\n' >&2
+  fi
+  _say "the public key, for authorized_keys and your git hosts:"
+  gpg --export-ssh-key "$id!"
+  printf 'ssh gpg:%s\n' "$id"
+}
+
+cmd_ssh() {
+  local source="${ssh_source:-}" file="${ssh_file:-}" nopass="${ssh_no_passphrase:-0}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --generate) source=generate ;;
+    --fido2) source=fido2 ;;
+    --existing)
+      source=existing
+      file="${2:-}"
+      [[ -n "$file" ]] || _die "--existing needs the private key file"
+      shift
+      ;;
+    --gpg) source=gpg ;;
+    --no-passphrase) nopass=1 ;;
+    *) _die "ssh: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  if [[ -z "$source" ]]; then
+    [[ $ANKH_YES -eq 1 ]] && _die "set \$ssh_source (generate, existing, gpg or fido2) with -y"
+    local ans
+    printf '  g) generate an ed25519 key\n  e) an existing key file (from a backup, a stick)\n' >&2
+    printf '  p) SSH through gpg-agent, with the gpg key'\''s authentication subkey\n' >&2
+    printf '  f) a FIDO2 key (ed25519-sk) on a security key\n' >&2
+    IFS= read -rp "SSH key: " ans </dev/tty
+    case "$ans" in
+    g) source=generate ;;
+    e)
+      source=existing
+      prompt file "Private key file" ""
+      ;;
+    p) source=gpg ;;
+    f) source=fido2 ;;
+    *) _die "invalid choice" ;;
+    esac
+  fi
+
+  case "$source" in
+  generate | fido2)
+    local type=ed25519 default=id_ed25519
+    [[ "$source" == fido2 ]] && type=ed25519-sk default=id_ed25519_sk
+    _ssh_place "$default"
+    local -a opts=(-t "$type" -f "$SSH_PATH" -C "$(id -un)@$(hostname 2>/dev/null || uname -n)")
+    if [[ "$nopass" -eq 1 ]]; then
+      _say "warning: no passphrase: anyone who copies $SSH_PATH can use it"
+      opts+=(-N '')
+    fi
+    [[ "$source" == fido2 ]] && _say "touch the security key when it blinks"
+    _tty ssh-keygen -q "${opts[@]}" || _die "ssh-keygen failed"
+    ;;
+  existing)
+    [[ -f "$file" ]] || _die "$file: no such file"
+    _ssh_place "$(basename "$file")"
+    cp "$file" "$SSH_PATH"
+    chmod 600 "$SSH_PATH"
+    if [[ -f "$file.pub" ]]; then
+      cp "$file.pub" "$SSH_PATH.pub"
+    else
+      _say "no $file.pub: deriving the public key (ssh-keygen may ask for the passphrase)"
+      _tty ssh-keygen -y -f "$SSH_PATH" >"$SSH_PATH.pub" || _die "could not derive the public key"
+    fi
+    ;;
+  gpg)
+    _ssh_gpg
+    return 0
+    ;;
+  *) _die "unknown ssh source '$source'" ;;
+  esac
+  chmod 644 "$SSH_PATH.pub"
+  _ssh_to_pass "$SSH_PATH"
+  _ssh_to_agent "$SSH_PATH"
+  _say "the public key, for authorized_keys and your git hosts:"
+  cat "$SSH_PATH.pub"
+  printf 'ssh %s\n' "$SSH_PATH"
+}
+
+# --- init --------------------------------------------------------------------
+
+cmd_init() {
+  [[ $# -eq 0 ]] || _die "init takes no options; use the environment with -y"
+  _say "where things stand now:"
+  cmd_check || true
+  echo ""
+  _say "1/3 the gpg key"
+  cmd_key
+  gpg_fpr="$KEY_FPR"
+  [[ -n "$gpg_fpr" ]] || _die "no key chosen"
+  echo ""
+  _say "2/3 the pass store"
+  cmd_pass
+  echo ""
+  _say "3/3 SSH"
+  cmd_ssh
+  echo ""
+  _say "where things stand now:"
+  cmd_check
+}
+
 main() {
   while [[ "${1:-}" == -y || "${1:-}" == --yes ]]; do
     ANKH_YES=1
@@ -1075,6 +1437,18 @@ main() {
   backup)
     shift
     cmd_backup "$@"
+    ;;
+  pass)
+    shift
+    cmd_pass "$@"
+    ;;
+  ssh)
+    shift
+    cmd_ssh "$@"
+    ;;
+  init)
+    shift
+    cmd_init "$@"
     ;;
   version | --version)
     printf 'ankh %s\n' "$ANKH_VERSION"

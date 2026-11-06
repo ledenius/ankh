@@ -13,3 +13,15 @@ complete -c ankh -n '__fish_seen_subcommand_from backup' -l key -r -d 'The key t
 complete -c ankh -n '__fish_seen_subcommand_from backup' -l encrypt -d 'Seal the backup with its own passphrase'
 complete -c ankh -n '__fish_seen_subcommand_from backup' -l remove-primary -d 'Then remove the primary key from this machine'
 complete -c ankh -n '__fish_seen_subcommand_from backup' -a '(__fish_complete_directories)'
+complete -c ankh -n __fish_use_subcommand -a init -d 'Check, then key, pass and ssh, then check again'
+complete -c ankh -n __fish_use_subcommand -a pass -d 'Check, clone or start the pass store'
+complete -c ankh -n __fish_use_subcommand -a ssh -d 'Generate or place an SSH key, or use gpg-agent'
+complete -c ankh -n '__fish_seen_subcommand_from pass' -l clone -r -d 'Clone the store from a git URL'
+complete -c ankh -n '__fish_seen_subcommand_from pass' -l new -d 'A new store encrypted to the key'
+complete -c ankh -n '__fish_seen_subcommand_from pass' -l remote -r -d "The new store's git remote"
+complete -c ankh -n '__fish_seen_subcommand_from pass' -l key -r -d 'The key'
+complete -c ankh -n '__fish_seen_subcommand_from ssh' -l generate -d 'A new ed25519 key'
+complete -c ankh -n '__fish_seen_subcommand_from ssh' -l existing -r -F -d 'An existing private key file'
+complete -c ankh -n '__fish_seen_subcommand_from ssh' -l gpg -d "The gpg key's authentication subkey, through gpg-agent"
+complete -c ankh -n '__fish_seen_subcommand_from ssh' -l fido2 -d 'An ed25519-sk key on a security key'
+complete -c ankh -n '__fish_seen_subcommand_from ssh' -l no-passphrase -d 'No passphrase on a generated key'

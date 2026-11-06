@@ -303,6 +303,96 @@ out="$(run_ankh "$d" -y backup "$d/after")"
 check_contains "a backup without the primary says so" "the backup holds the subkeys only" "$out"
 check "and writes no secret.asc" "" "$([[ -f "$d/after/secret.asc" ]] && echo 1)"
 
+# --- pass, ssh and init --------------------------------------------------------
+
+d6="" d7="" d8=""
+new_home d6
+with_pinentry "$d6" "second passphrase"
+key_source=generate gpg_name="Store User" gpg_email=store@example.invalid run_ankh "$d6" -y key >/dev/null
+sfpr="$(GNUPGHOME="$d6/gnupg" gpg --with-colons --list-secret-keys 2>/dev/null | awk -F: '/^fpr/{print $10; exit}')"
+
+out="$(pass_source=new pass_remote="$d6/remote.git" run_ankh "$d6" -y pass)"
+check_contains "pass --new starts a store" "pass $d6/store" "$out"
+check "the new store is encrypted to the key" "$sfpr" "$(cat "$d6/store/.gpg-id")"
+check "the new store is a git repository" "true" "$(git -C "$d6/store" rev-parse --is-inside-work-tree 2>/dev/null)"
+check "the remote is set" "$d6/remote.git" "$(git -C "$d6/store" remote get-url origin)"
+
+printf 'canary-value-must-not-appear\n' |
+  HOME="$d6/home" GNUPGHOME="$d6/gnupg" PASSWORD_STORE_DIR="$d6/store" pass insert -m example.invalid/login >/dev/null
+out="$(run_ankh "$d6" -y pass)"
+check_contains "an existing store for this key is accepted" "already here, encrypted to this key" "$out"
+check_not_contains "pass never shows a value" "canary-value" "$out"
+
+# Clone onto a second machine that has the subkeys.
+git init -q --bare -b main "$d6/remote.git"
+git -C "$d6/store" push -q origin HEAD:refs/heads/main 2>/dev/null
+new_home d7
+with_pinentry "$d7" "second passphrase"
+GNUPGHOME="$d6/gnupg" gpg --batch --pinentry-mode loopback --passphrase 'second passphrase' \
+  --export-secret-subkeys "$sfpr" 2>/dev/null >"$d7/sub.asc"
+key_source=import key_file="$d7/sub.asc" run_ankh "$d7" -y key >/dev/null
+out="$(pass_source=clone pass_remote="$d6/remote.git" run_ankh "$d7" -y pass)"
+check_contains "pass --clone clones the store" "cloning $d6/remote.git" "$out"
+check_contains "and proves it decrypts" "test decrypt of one entry" "$out"
+check_not_contains "a clone never shows a value" "canary-value" "$out"
+check "a store on a machine without a git identity commits as the key's user" "store@example.invalid" "$(git -C "$d6/store" log -1 --format=%ae 2>/dev/null)"
+
+# A store for someone else's key.
+new_home d8
+with_pinentry "$d8" "third passphrase"
+key_source=generate gpg_name="Other User" gpg_email=other@example.invalid run_ankh "$d8" -y key >/dev/null
+cp -r "$d6/store" "$d8/store"
+out="$(run_ankh "$d8" -y pass)"
+check_contains "a store for another key is refused" "encrypted to another key" "$out"
+
+# SSH: generated, named and placed as asked, backed up into pass.
+out="$(ssh_source=generate ssh_no_passphrase=1 run_ankh "$d6" -y ssh)"
+k="$d6/home/.ssh/id_ed25519"
+check_contains "ssh --generate makes ~/.ssh/id_ed25519 by default" "ssh $k" "$out"
+check "the private key is 600" "600" "$(stat -c %a "$k")"
+check "the public key is 644" "644" "$(stat -c %a "$k.pub")"
+check "the .ssh directory is 700" "700" "$(stat -c %a "$d6/home/.ssh")"
+check_contains "the public key is printed" "ssh-ed25519 " "$out"
+check "the key is backed up into pass" "same" \
+  "$(HOME="$d6/home" GNUPGHOME="$d6/gnupg" PASSWORD_STORE_DIR="$d6/store" pass show ssh/id_ed25519/key 2>/dev/null | cmp -s - "$k" && echo same)"
+
+out="$(ssh_source=generate ssh_no_passphrase=1 run_ankh "$d6" -y ssh)"
+check_contains "an existing key is never overwritten" "exists already" "$out"
+
+out="$(ssh_source=generate ssh_no_passphrase=1 ssh_name=work ssh_dir="$d6/home/.ssh/keys" run_ankh "$d6" -y ssh)"
+check_contains "the name and directory can be chosen" "ssh $d6/home/.ssh/keys/work" "$out"
+
+# An existing key keeps its own name by default.
+cp "$k" "$d7/laptop_key"
+out="$(ssh_source=existing ssh_file="$d7/laptop_key" run_ankh "$d7" -y ssh)"
+check_contains "an existing key keeps its name" "ssh $d7/home/.ssh/laptop_key" "$out"
+check "its public key is derived when missing" "1" "$([[ -s "$d7/home/.ssh/laptop_key.pub" ]] && echo 1)"
+
+# SSH through gpg-agent.
+out="$(ssh_source=gpg run_ankh "$d6" -y ssh)"
+sgrip="$(GNUPGHOME="$d6/gnupg" gpg --with-colons --with-keygrip --list-secret-keys "$sfpr" |
+  awk -F: '/^ssb/{a=($12 ~ /a/)} /^grp/ && a{print $10; exit}')"
+check_contains "ssh --gpg turns on SSH support" "enable-ssh-support" "$(cat "$d6/gnupg/gpg-agent.conf")"
+check_contains "ssh --gpg lists the keygrip in sshcontrol" "$sgrip" "$(cat "$d6/gnupg/sshcontrol")"
+check_contains "ssh --gpg prints the SSH_AUTH_SOCK line" "agent-ssh-socket" "$out"
+check_contains "ssh --gpg prints the public key" "ssh-ed25519 " "$out"
+gsock="$(GNUPGHOME="$d6/gnupg" gpgconf --list-dirs agent-ssh-socket)"
+check "gpg-agent then offers it" "1" "$(SSH_AUTH_SOCK="$gsock" ssh-add -l 2>/dev/null | grep -c ED25519)"
+
+# init, end to end, on an empty machine.
+new_home d8
+with_pinentry "$d8" "fourth passphrase"
+out="$(key_source=generate gpg_name="Init User" gpg_email=init@example.invalid pass_source=new \
+  ssh_source=generate ssh_no_passphrase=1 run_ankh "$d8" -y init)"
+rc=$?
+check "init on an empty machine ends well" "0" "$rc"
+check_contains "init starts with a check" "check: 3 failed" "$out"
+check_contains "init ends with a clean check" "check: 0 failed" "$out"
+check "init leaves a key, a store and an SSH key" "1 1 1" \
+  "$([[ -n "$(GNUPGHOME="$d8/gnupg" gpg --list-secret-keys 2>/dev/null)" ]] && echo -n 1; echo -n ' '
+     [[ -f "$d8/store/.gpg-id" ]] && echo -n 1; echo -n ' '
+     [[ -f "$d8/home/.ssh/id_ed25519" ]] && echo -n 1)"
+
 echo ""
 echo "$pass_count passed, $fail_count failed"
 [[ $fail_count -eq 0 ]]
